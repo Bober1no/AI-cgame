@@ -82,7 +82,7 @@ function progress(d){
 async function hasWebGPU(){ try{ return !!(navigator.gpu && await navigator.gpu.requestAdapter()); }catch(e){ return false; } }
 
 let clip=null, fl=null, flProc=null, flDevice='', qw=null, qwProc=null, qwName='';
-async function load(){
+async function load(opt={}){
   let browserCache=false; try{ await caches.open('nw-test'); browserCache=true; }catch(e){}
   if(!browserCache){ T.env.useBrowserCache=false; T.env.useCustomCache=true; T.env.customCache=idbCache; }
   const gpu=await hasWebGPU();
@@ -101,8 +101,8 @@ async function load(){
   }
   if(fl){ try{ flProc=await T.AutoProcessor.from_pretrained(fid); }catch(e){ console.warn(e); fl=null; } }
   // Qwen3.5: descriptions and the entity's lines. WebGPU only. 2B first, 0.8B if it can't fit. thinking stays off.
-  if(gpu && T.Qwen3_5ForConditionalGeneration){
-    const ids=(navigator.deviceMemory&&navigator.deviceMemory<=4)?['onnx-community/Qwen3.5-0.8B-ONNX-OPT']:['onnx-community/Qwen3.5-2B-ONNX-OPT','onnx-community/Qwen3.5-0.8B-ONNX-OPT'];
+  if(gpu && opt.qwen!=='none' && T.Qwen3_5ForConditionalGeneration){
+    const ids=(opt.qwen==='small'||navigator.deviceMemory&&navigator.deviceMemory<=4)?['onnx-community/Qwen3.5-0.8B-ONNX-OPT']:['onnx-community/Qwen3.5-2B-ONNX-OPT','onnx-community/Qwen3.5-0.8B-ONNX-OPT'];
     for(const qid of ids){
       try{
         qwProc=await T.AutoProcessor.from_pretrained(qid);
@@ -121,7 +121,7 @@ onmessage=async e=>{
   const {id,cmd,args}=e.data;
   try{
     let r;
-    if(cmd==='load') r=await load();
+    if(cmd==='load') r=await load(args);
     else if(cmd==='clip'){
       const out=await clip(toImage(args.img),args.labels,{hypothesis_template:args.tmpl});
       r=out.map(o=>({label:o.label,score:o.score}));
@@ -585,6 +585,23 @@ const S={state:'idle', place:null, behind:null, cloth:null, clothColour:null, wa
 // the heavy models (CLIP, Florence-2, Qwen3.5) run in a background worker, so loading and
 // running them never freezes the page. AI.clip / AI.fl / AI.qw just say which ones loaded.
 const AI={clip:false, fl:false, qw:false, flDevice:'', qwName:'', loading:null};
+
+// crash-safe mode. a "stage" marker is saved before risky steps and cleared after.
+// a normal close/refresh clears it too, so a marker still there on the next load means the tab crashed.
+const params=new URLSearchParams(location.search);
+const store={ get(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }, set(k,v){ try{ v==null?localStorage.removeItem(k):localStorage.setItem(k,v); }catch(e){} } };
+if(params.has('reset')){ store.set('nw-crash',null); store.set('nw-stage',null); }
+const CRASH=(()=>{ try{ return JSON.parse(store.get('nw-crash')||'{}'); }catch(e){ return {}; } })();
+const crashedAt=store.get('nw-stage');
+if(crashedAt){ CRASH[crashedAt]=(CRASH[crashedAt]||0)+1; store.set('nw-crash',JSON.stringify(CRASH)); store.set('nw-stage',null); }
+function stage(n){ store.set('nw-stage',n); }
+addEventListener('pagehide',()=>stage(null));
+const aiCrashes=(CRASH.models||0)+(CRASH.analyse||0);
+const OPT={
+  rear: !params.has('norear') && !CRASH.rear,
+  qwen: params.has('noqwen') ? 'none' : aiCrashes>=2 ? 'none' : aiCrashes===1 ? 'small' : 'full',
+};
+const STAGE_NAME={rear:'switching to the back camera', models:'loading the AI models', analyse:'the AI analysing the camera'};
 const aiEl=document.getElementById('ai');
 function aiStatus(t){ aiEl.textContent=t?('SCENE AI · '+t):''; }
 let aiWorker=null, rpcId=0; const rpcPending=new Map();
@@ -615,11 +632,13 @@ function loadAI(){
   return AI.loading ||= (async()=>{
     aiStatus('loading library');
     try{
-      const r=await rpc('load');
+      stage('models');
+      const r=await rpc('load',{qwen:OPT.qwen});
+      stage(null);
       Object.assign(AI,r);
       aiStatus(AI.clip||AI.fl||AI.qw?'models ready':'offline');
       return !!(AI.clip||AI.fl||AI.qw);
-    }catch(e){ console.warn('loadAI',e); aiStatus('offline'); return false; }
+    }catch(e){ stage(null); console.warn('loadAI',e); aiStatus('offline'); return false; }
   })();
 }
 
@@ -725,7 +744,7 @@ async function florence(task,canvas,max){
 const PEOPLEWORDS=/\b(man|men|woman|women|boy|girl|person|people|guy|face|head|hair|eye|eyes|nose|mouth|ear|shirt|hand|arm|student|teen|child|kid|he|she|his|her)\b/i;
 async function analyse(snap){
   if(!await loadAI()) { S.state='failed'; return; }
-  S.state='analysing';
+  S.state='analysing'; stage('analyse');
   try{
     if(AI.clip){
       aiStatus('analysing location');
@@ -831,10 +850,10 @@ async function analyse(snap){
       }
       if(AI.fl && !S.frontCaption){ try{ const r=await florence('<MORE_DETAILED_CAPTION>',snap.rear,100); S.frontCaption=fixArticle(String(r.out||'').trim()); }catch(e){} }
     }
-    S.state='ready'; aiStatus('analysis complete');
+    stage(null); S.state='ready'; aiStatus('analysis complete');
     if(running && watching && !S.announced){ S.announced=true; interject(`scene analysis complete. ${S.log.length} questions answered about you. it knows where you are now.`); }
     setTimeout(()=>{ if(S.state==='ready') aiStatus(''); },6000);
-  }catch(e){ console.warn('analyse',e); S.state=S.place?'ready':'failed'; aiStatus(S.place?'partial analysis':'analysis failed'); }
+  }catch(e){ stage(null); console.warn('analyse',e); S.state=S.place?'ready':'failed'; aiStatus(S.place?'partial analysis':'analysis failed'); }
 }
 // prints everything the models produced, straight into the terminal
 async function dumpModels(title){
@@ -1005,6 +1024,9 @@ const DESC={
 async function intro(){
   out.innerHTML='';
   addLine('NIGHTWATCH','big'); gap();
+  if(crashedAt) addLine(`last time the page crashed while ${STAGE_NAME[crashedAt]||crashedAt}.`,'red');
+  const off=[!OPT.rear&&'back camera', OPT.qwen==='small'&&'big AI model (using the small one)', OPT.qwen==='none'&&'Qwen AI'].filter(Boolean);
+  if(off.length){ addLine('safe mode: switched off '+listify(off)+'.','red'); addLine('to try everything again, add ?reset to the end of the address.','dim'); gap(); }
   addLine('a short text horror game. about eight minutes.');
   addLine('headphones on. lights off if you think you\'re tough.'); gap();
   addLine('this game watches you through your webcam the whole time.','dim');
@@ -1311,8 +1333,6 @@ async function boot(){
   await type('loading neural networks (first run downloads ~10MB)...',{cls:'dim',pause:100});
   const ok=await loadVision((t,c='dim')=>addLine('  '+t,c));
   if(!ok){ await type('vision offline. basic motion tracking only.',{cls:'dim'}); return false; }
-  loadAI();
-  addLine('  scene models (CLIP, Florence-2, Qwen3.5) .. downloading in background','dim');
   await type('compiling shaders...',{cls:'dim',pause:50});
   try{ await human.detect(video); }catch(e){}
   visionOn=true; visionLoop();
@@ -1329,9 +1349,14 @@ async function boot(){
   if(got) await dumpModels('CALIBRATION :: RAW OUTPUT');
   await type('capturing environment for analysis...',{cls:'dim',pause:100});
   const snap=snapshot(); wantSeg=false; S.base=snap.metrics;
-  const rl=addLine('  rear sensor ............. checking','dim');
-  snap.rear=await Promise.race([rearSnap(), sleep(20000).then(()=>null)]);
-  rl.textContent='  rear sensor ............. '+(snap.rear?'captured':location.protocol==='file:'?'unavailable (open the game from a web address, not a file)':'not found');
+  if(OPT.rear){
+    const rl=addLine('  rear sensor ............. checking','dim');
+    stage('rear');
+    snap.rear=await Promise.race([rearSnap(), sleep(20000).then(()=>null)]);
+    stage(null);
+    rl.textContent='  rear sensor ............. '+(snap.rear?'captured':location.protocol==='file:'?'unavailable (open the game from a web address, not a file)':'not found');
+  } else addLine('  rear sensor ............. off','dim');
+  addLine(`  scene models ............ loading in background${OPT.qwen==='small'?' (small mode)':OPT.qwen==='none'?' (safe mode, no qwen)':''}`,'dim');
   analyse(snap);
   addLine('  > frame captured. analysis runs in the background. nothing leaves this computer.','dim');
   addLine('  > first run downloads the scene models. progress is shown top right.','dim');
