@@ -48,6 +48,105 @@ canvas.feed{width:100%;max-width:680px;display:block;border:1px solid var(--dim)
 <div id="ai" aria-live="polite"></div>
 <div id="scare"><canvas></canvas></div>
 <div id="vig"></div><div id="crt"></div>
+<script type="text/plain" id="ai-worker">
+// NIGHTWATCH scene-model worker. Loads and runs CLIP, Florence-2 and Qwen3.5 off the main thread.
+import * as T from '__TJS__';
+T.env.allowLocalModels=false;
+
+// file:// pages often can't use the Cache API, so fall back to IndexedDB to avoid re-downloading every run
+const idbCache={
+  db:null,
+  open(){ return this.db ||= new Promise((res,rej)=>{ const r=indexedDB.open('nightwatch-models',1); r.onupgradeneeded=()=>r.result.createObjectStore('f'); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); },
+  async match(key){
+    try{ const db=await this.open(); const v=await new Promise(res=>{ const q=db.transaction('f').objectStore('f').get(String(key)); q.onsuccess=()=>res(q.result); q.onerror=()=>res(undefined); });
+      return v ? new Response(v.blob,{headers:{'content-type':v.type||'application/octet-stream','content-length':String(v.blob.size)}}) : undefined; }
+    catch(e){ return undefined; }
+  },
+  async put(key,response){
+    try{ const blob=await response.blob(); const db=await this.open();
+      await new Promise(res=>{ const t=db.transaction('f','readwrite'); t.objectStore('f').put({blob,type:response.headers.get('content-type')},String(key)); t.oncomplete=res; t.onerror=res; t.onabort=res; }); }
+    catch(e){}
+  }
+};
+
+const status=text=>postMessage({type:'status',text});
+const files=new Map(); let lastStatus=0;
+function progress(d){
+  if(d.status==='progress' && d.total) files.set(d.name+'/'+d.file,{l:d.loaded,t:d.total});
+  else if(d.status==='done'){ const f=files.get(d.name+'/'+d.file); if(f) f.l=f.t; }
+  else return;
+  const now=Date.now(); if(now-lastStatus<200) return; lastStatus=now;
+  let l=0,t=0; for(const f of files.values()){ l+=f.l; t+=f.t; }
+  if(t) status(l>=t?'preparing models (this can take a minute)':`downloading ${Math.floor(l/t*100)}%  ${Math.round(l/1048576)}/${Math.round(t/1048576)}MB`);
+}
+async function hasWebGPU(){ try{ return !!(navigator.gpu && await navigator.gpu.requestAdapter()); }catch(e){ return false; } }
+
+let clip=null, fl=null, flProc=null, flDevice='', qw=null, qwProc=null, qwName='';
+async function load(){
+  let browserCache=false; try{ await caches.open('nw-test'); browserCache=true; }catch(e){}
+  if(!browserCache){ T.env.useBrowserCache=false; T.env.useCustomCache=true; T.env.customCache=idbCache; }
+  const gpu=await hasWebGPU();
+  // CLIP: small, structured answers
+  for(const id of ['Xenova/clip-vit-base-patch16','Xenova/clip-vit-base-patch32']){
+    try{ clip=await T.pipeline('zero-shot-image-classification',id,{device:'wasm',dtype:'q8',progress_callback:progress}); break; }
+    catch(e){ console.warn('clip',id,e); }
+  }
+  // Florence-2: captions + labelled regions
+  const fid='onnx-community/Florence-2-base-ft';
+  const tries=[...(gpu?[{device:'webgpu',dtype:{embed_tokens:'fp16',vision_encoder:'fp16',encoder_model:'q4',decoder_model_merged:'q4'}}]:[]),
+               {device:'wasm',dtype:'q8'},{device:'wasm',dtype:'fp32'}];
+  for(const o of tries){
+    try{ fl=await T.Florence2ForConditionalGeneration.from_pretrained(fid,{...o,progress_callback:progress}); flDevice=o.device; break; }
+    catch(e){ console.warn('florence',o.device,e); }
+  }
+  if(fl){ try{ flProc=await T.AutoProcessor.from_pretrained(fid); }catch(e){ console.warn(e); fl=null; } }
+  // Qwen3.5: descriptions and the entity's lines. WebGPU only. 2B first, 0.8B if it can't fit. thinking stays off.
+  if(gpu && T.Qwen3_5ForConditionalGeneration){
+    const ids=(navigator.deviceMemory&&navigator.deviceMemory<=4)?['onnx-community/Qwen3.5-0.8B-ONNX-OPT']:['onnx-community/Qwen3.5-2B-ONNX-OPT','onnx-community/Qwen3.5-0.8B-ONNX-OPT'];
+    for(const qid of ids){
+      try{
+        qwProc=await T.AutoProcessor.from_pretrained(qid);
+        qw=await T.Qwen3_5ForConditionalGeneration.from_pretrained(qid,{device:'webgpu',dtype:{embed_tokens:'q4',vision_encoder:'fp16',decoder_model_merged:'q4'},progress_callback:progress});
+        qwName=qid.includes('2B')?'qwen 2b':'qwen 0.8b';
+        break;
+      }catch(e){ console.warn('qwen',qid,e); qw=null; qwProc=null; }
+    }
+  }
+  return {clip:!!clip, fl:!!fl, flDevice, qw:!!qw, qwName};
+}
+
+const toImage=m=>new T.RawImage(new Uint8ClampedArray(m.data),m.width,m.height,4);
+
+onmessage=async e=>{
+  const {id,cmd,args}=e.data;
+  try{
+    let r;
+    if(cmd==='load') r=await load();
+    else if(cmd==='clip'){
+      const out=await clip(toImage(args.img),args.labels,{hypothesis_template:args.tmpl});
+      r=out.map(o=>({label:o.label,score:o.score}));
+    }
+    else if(cmd==='florence'){
+      const img=toImage(args.img);
+      const inputs=await flProc(img,flProc.construct_prompts(args.task));
+      const ids=await fl.generate({...inputs,max_new_tokens:args.max});
+      const raw=flProc.batch_decode(ids,{skip_special_tokens:false})[0];
+      r={raw, out:flProc.post_process_generation(raw,args.task,img.size)[args.task]};
+    }
+    else if(cmd==='qwen'){
+      // non-thinking: the assistant turn opens with an empty think block
+      const prompt=`<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>${args.question}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`;
+      const inputs=await qwProc(prompt,toImage(args.img));
+      const out=await qw.generate({...inputs,max_new_tokens:args.max,repetition_penalty:1.1,
+        ...(args.sample?{do_sample:true,temperature:args.temp,top_p:.9}:{do_sample:false})});
+      const seq=out.sequences||out;
+      const t=qwProc.batch_decode(seq,{skip_special_tokens:false})[0]||'';
+      r=t.split('</think>').pop().replace(/<\|[^|]*\|>/g,'').trim();
+    }
+    postMessage({id,ok:true,r});
+  }catch(err){ postMessage({id,ok:false,err:String(err&&err.message||err)}); }
+};
+</script>
 
 <script>
 // =====================================================================
@@ -483,72 +582,44 @@ const TJS='https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1/dist/tra
 const S={state:'idle', place:null, behind:null, cloth:null, clothColour:null, wall:null, hairLen:null, hairColour:null,
   glasses:false, headphones:false, hat:null, caption:'', faceCaption:'', regions:[], items:[], announced:false,
   facialHair:null, eyes:null, faceShape:null, brows:null, freckles:false, piercing:false, log:[], rawCaption:'', rawFace:'', rawRegions:'', lines:[], frontList:[], behindList:[], frontCaption:'', base:null, q:null, hairText:''};
-const AI={T:null, clip:null, fl:null, flProc:null, files:new Map(), loading:null};
+// the heavy models (CLIP, Florence-2, Qwen3.5) run in a background worker, so loading and
+// running them never freezes the page. AI.clip / AI.fl / AI.qw just say which ones loaded.
+const AI={clip:false, fl:false, qw:false, flDevice:'', qwName:'', loading:null};
 const aiEl=document.getElementById('ai');
 function aiStatus(t){ aiEl.textContent=t?('SCENE AI · '+t):''; }
-function aiProgress(d){
-  if(d.status==='progress' && d.total){ AI.files.set(d.name+'/'+d.file,{l:d.loaded,t:d.total}); }
-  else if(d.status==='done'){ const f=AI.files.get(d.name+'/'+d.file); if(f) f.l=f.t; }
-  else return;
-  let l=0,t=0; for(const f of AI.files.values()){ l+=f.l; t+=f.t; }
-  if(t) aiStatus(`downloading ${Math.floor(l/t*100)}%  ${Math.round(l/1048576)}/${Math.round(t/1048576)}MB`);
+let aiWorker=null, rpcId=0; const rpcPending=new Map();
+function getWorker(){
+  if(aiWorker) return aiWorker;
+  const src=document.getElementById('ai-worker').textContent.replace('__TJS__',TJS);
+  aiWorker=new Worker(URL.createObjectURL(new Blob([src],{type:'text/javascript'})),{type:'module'});
+  aiWorker.onmessage=e=>{
+    const m=e.data;
+    if(m.type==='status'){ aiStatus(m.text); return; }
+    const p=rpcPending.get(m.id); if(!p) return; rpcPending.delete(m.id);
+    m.ok ? p.res(m.r) : p.rej(new Error(m.err));
+  };
+  aiWorker.onerror=e=>{ console.warn('ai worker',e.message||e); for(const p of rpcPending.values()) p.rej(new Error('ai worker failed')); rpcPending.clear(); };
+  return aiWorker;
 }
-
-// file:// pages often can't use the Cache API, so fall back to IndexedDB to avoid re-downloading every run
-const idbCache={
-  db:null,
-  open(){ return this.db ||= new Promise((res,rej)=>{ const r=indexedDB.open('nightwatch-models',1); r.onupgradeneeded=()=>r.result.createObjectStore('f'); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); },
-  async match(key){
-    try{ const db=await this.open(); const v=await new Promise(res=>{ const q=db.transaction('f').objectStore('f').get(String(key)); q.onsuccess=()=>res(q.result); q.onerror=()=>res(undefined); });
-      return v ? new Response(v.blob,{headers:{'content-type':v.type||'application/octet-stream','content-length':String(v.blob.size)}}) : undefined; }
-    catch(e){ return undefined; }
-  },
-  async put(key,response){
-    try{ const blob=await response.blob(); const db=await this.open();
-      await new Promise(res=>{ const t=db.transaction('f','readwrite'); t.objectStore('f').put({blob,type:response.headers.get('content-type')},String(key)); t.oncomplete=res; t.onerror=res; t.onabort=res; }); }
-    catch(e){}
-  }
-};
-async function hasWebGPU(){ try{ return !!(navigator.gpu && await navigator.gpu.requestAdapter()); }catch(e){ return false; } }
-
+function rpc(cmd,args={},transfer=[]){
+  return new Promise((res,rej)=>{ const id=++rpcId; rpcPending.set(id,{res,rej}); getWorker().postMessage({id,cmd,args},transfer); });
+}
+// canvas -> raw pixels the worker can rebuild into an image (optionally shrunk first)
+function pixels(canvas,w,h){
+  let c=canvas;
+  if(w){ c=document.createElement('canvas'); c.width=w; c.height=h; c.getContext('2d').drawImage(canvas,0,0,w,h); }
+  const d=c.getContext('2d').getImageData(0,0,c.width,c.height);
+  return {data:d.data.buffer,width:d.width,height:d.height};
+}
 function loadAI(){
   return AI.loading ||= (async()=>{
     aiStatus('loading library');
-    try{ AI.T=await import(TJS); }catch(e){ console.warn(e); aiStatus('offline'); return false; }
-    const T=AI.T;
-    T.env.allowLocalModels=false;
-    let browserCache=false; try{ await caches.open('nw-test'); browserCache=true; }catch(e){}
-    if(!browserCache){ T.env.useBrowserCache=false; T.env.useCustomCache=true; T.env.customCache=idbCache; }
-    const gpu=await hasWebGPU();
-    // CLIP: small, structured answers
-    for(const id of ['Xenova/clip-vit-base-patch16','Xenova/clip-vit-base-patch32']){
-      try{ AI.clip=await T.pipeline('zero-shot-image-classification',id,{device:'wasm',dtype:'q8',progress_callback:aiProgress}); break; }
-      catch(e){ console.warn('clip',id,e); }
-    }
-    // Florence-2: captions + labelled regions
-    const fid='onnx-community/Florence-2-base-ft';
-    const tries=[...(gpu?[{device:'webgpu',dtype:{embed_tokens:'fp16',vision_encoder:'fp16',encoder_model:'q4',decoder_model_merged:'q4'}}]:[]),
-                 {device:'wasm',dtype:'q8'},{device:'wasm',dtype:'fp32'}];
-    for(const o of tries){
-      try{ AI.fl=await T.Florence2ForConditionalGeneration.from_pretrained(fid,{...o,progress_callback:aiProgress}); AI.flDevice=o.device; break; }
-      catch(e){ console.warn('florence',o.device,e); }
-    }
-    if(AI.fl){ try{ AI.flProc=await T.AutoProcessor.from_pretrained(fid); }catch(e){ console.warn(e); AI.fl=null; } }
-    // Qwen3.5: vision-language model for the descriptions and the entity's lines. WebGPU only.
-    // 2B first (much smarter), 0.8B if the GPU can't fit it. thinking stays off.
-    if(gpu && T.Qwen3_5ForConditionalGeneration){
-      const ids=(navigator.deviceMemory&&navigator.deviceMemory<=4)?['onnx-community/Qwen3.5-0.8B-ONNX-OPT']:['onnx-community/Qwen3.5-2B-ONNX-OPT','onnx-community/Qwen3.5-0.8B-ONNX-OPT'];
-      for(const qid of ids){
-        try{
-          AI.qwProc=await T.AutoProcessor.from_pretrained(qid);
-          AI.qw=await T.Qwen3_5ForConditionalGeneration.from_pretrained(qid,{device:'webgpu',dtype:{embed_tokens:'q4',vision_encoder:'fp16',decoder_model_merged:'q4'},progress_callback:aiProgress});
-          AI.qwName=qid.includes('2B')?'qwen 2b':'qwen 0.8b';
-          break;
-        }catch(e){ console.warn('qwen',qid,e); AI.qw=null; AI.qwProc=null; }
-      }
-    }
-    aiStatus(AI.clip||AI.fl||AI.qw?'models ready':'offline');
-    return !!(AI.clip||AI.fl||AI.qw);
+    try{
+      const r=await rpc('load');
+      Object.assign(AI,r);
+      aiStatus(AI.clip||AI.fl||AI.qw?'models ready':'offline');
+      return !!(AI.clip||AI.fl||AI.qw);
+    }catch(e){ console.warn('loadAI',e); aiStatus('offline'); return false; }
   })();
 }
 
@@ -624,23 +695,16 @@ const clothText=()=>S.cloth?(S.clothColour?`${S.clothColour} ${S.cloth}`:S.cloth
 const hairText=()=>S.hairText||(S.hairLen&&S.hairColour?`${S.hairLen} ${S.hairColour} hair`:'');
 async function ask(canvas,set,tmpl,name){
   const labels=set.map(x=>Array.isArray(x)?x[0]:x);
-  const r=await AI.clip(AI.T.RawImage.fromCanvas(canvas),labels,{hypothesis_template:tmpl});
+  const img=pixels(canvas);
+  const r=await rpc('clip',{img,labels,tmpl},[img.data]);
   const top=r[0], item=set[labels.indexOf(top.label)];
   if(name) S.log.push(`[clip] ${name.padEnd(13)} ${r.slice(0,3).map(o=>`${disp(set[labels.indexOf(o.label)])} ${pct(o.score)}`).join(' | ')}`);
   return {item, score:top.score};
 }
 async function yes(canvas,a,b,name){ const r=await ask(canvas,[[a,'yes'],[b,'no']],'a photo of {}',name); return r.item[1]==='yes' && r.score>.62; }
 async function qwen(canvas,question,{max=140,sample=false,temp=.8}={}){
-  const img=await AI.T.RawImage.fromCanvas(canvas).resize(448,448);
-  // non-thinking: the assistant turn opens with an empty think block
-  const prompt=`<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>${question}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`;
-  const inputs=await AI.qwProc(prompt,img);
-  const out=await AI.qw.generate({...inputs,max_new_tokens:max,repetition_penalty:1.1,
-    ...(sample?{do_sample:true,temperature:temp,top_p:.9}:{do_sample:false})});
-  const seq=out.sequences||out;
-  let t=AI.qwProc.batch_decode(seq,{skip_special_tokens:false})[0]||'';
-  t=t.split('</think>').pop().replace(/<\|[^|]*\|>/g,'').trim();
-  return t;
+  const img=pixels(canvas,448,448);
+  return rpc('qwen',{img,question,max,sample,temp},[img.data]);
 }
 const FACTS_PROMPT='Answer in JSON only, no other text. Keys: "top": what the person is wearing on their upper body, 2-4 words with colour, e.g. "grey hoodie". "hair": 2-5 words, e.g. "short light brown hair". "hood_up": true or false. "glasses": true or false. "headphones": true or false. "behind": an array of up to 4 specific objects that are clearly visible behind or around the person, 1-3 words each, e.g. ["wooden cabinet","white microwave"]. Only include things you can clearly see. Do not include clothing or body parts in "behind".';
 const cleanList=a=>(Array.isArray(a)?a:[]).map(x=>String(x).toLowerCase().trim().replace(/^(a|an|the) /,'')).filter(x=>x && x.length<30 && !PEOPLEWORDS.test(x));
@@ -655,11 +719,8 @@ function trimCut(t){
   return end>40 && end<t.length-1 ? t.slice(0,end+1) : t;
 }
 async function florence(task,canvas,max){
-  const img=AI.T.RawImage.fromCanvas(canvas);
-  const inputs=await AI.flProc(img,AI.flProc.construct_prompts(task));
-  const ids=await AI.fl.generate({...inputs,max_new_tokens:max});
-  const raw=AI.flProc.batch_decode(ids,{skip_special_tokens:false})[0];
-  return {raw, out:AI.flProc.post_process_generation(raw,task,img.size)[task]};
+  const img=pixels(canvas);
+  return rpc('florence',{img,task,max},[img.data]);
 }
 const PEOPLEWORDS=/\b(man|men|woman|women|boy|girl|person|people|guy|face|head|hair|eye|eyes|nose|mouth|ear|shirt|hand|arm|student|teen|child|kid|he|she|his|her)\b/i;
 async function analyse(snap){
@@ -814,38 +875,51 @@ function objPool(){
 }
 function takeObjects(n){ const o=objPool().slice(0,n); o.forEach(x=>usedFacts.add('obj:'+x)); return o.map(x=>fixArticle('a '+x)); }
 
-// one still from the rear camera (phones, and tablets like the Surface), to see what's in front of the player
+// one still from the rear camera (phones, and tablets like the Surface), to see what's in front of the player.
+// every step has a time limit: some drivers never answer when you switch cameras, and the game must not hang on it.
+const timeout=(p,ms,label)=>Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(new Error(label+' timed out')),ms))]);
+async function openCam(constraints,ms){
+  const p=navigator.mediaDevices.getUserMedia(constraints);
+  try{ return await timeout(p,ms,'camera open'); }
+  catch(e){ p.then(st=>st.getTracks().forEach(t=>t.stop())).catch(()=>{}); throw e; }   // if it answers late, shut it
+}
 async function rearSnap(){
-  let stopped=false;
+  let stopped=false, rs=null;
   try{
-    const devs=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput');
+    const devs=(await timeout(navigator.mediaDevices.enumerateDevices(),3000,'device list')).filter(d=>d.kind==='videoinput');
     console.log('cameras:',devs.map(d=>d.label||'(no label)'));
     if(devs.length<2) return null;
     const curId=stream?.getVideoTracks()[0]?.getSettings().deviceId;
-    // a named rear camera wins; skip IR / virtual cameras and the one we're already using
+    // a named rear camera wins; skip IR / virtual cameras and the one already in use
     const byName=devs.find(d=>/rear|back|environment|world/i.test(d.label) && !/\bir\b|infrared|virtual|effects|obs/i.test(d.label) && d.deviceId!==curId);
     const labelled=devs.some(d=>d.label);
-    if(labelled && !byName && !devs.some(d=>/front|user|face/i.test(d.label))) return null;   // e.g. two webcams on a desktop
+    if(labelled && !byName && !devs.some(d=>/front|user|face/i.test(d.label))) return null;
     // most devices can't run both cameras at once
     if(stream) stream.getTracks().forEach(t=>t.stop()); stopped=true;
+    await sleep(300);   // give the driver a moment to release the front camera
     const tries=[];
     if(byName) tries.push({deviceId:{exact:byName.deviceId}});
     tries.push({facingMode:{exact:'environment'}});
-    let rs=null;
     for(const t of tries){
-      try{ rs=await navigator.mediaDevices.getUserMedia({video:{...t,width:{ideal:1280},height:{ideal:960}},audio:false}); break; }
-      catch(e){ console.warn('rear camera try failed',t,e.name); }
+      try{ rs=await openCam({video:{...t,width:{ideal:1280},height:{ideal:960}},audio:false},5000); break; }
+      catch(e){ console.warn('rear camera try failed',t,e.message||e.name); }
     }
     if(!rs) return null;
-    const rv=document.createElement('video'); rv.muted=true; rv.playsInline=true; rv.srcObject=rs; await rv.play();
+    const rv=document.createElement('video'); rv.muted=true; rv.playsInline=true; rv.srcObject=rs;
+    try{ await timeout(rv.play(),3000,'rear play'); }catch(e){ console.warn(e.message); }
     for(let i=0;i<60 && !rv.videoWidth;i++) await sleep(50);
     await sleep(900); // let exposure settle
     let c=null;
     if(rv.videoWidth){ c=document.createElement('canvas'); c.width=rv.videoWidth; c.height=rv.videoHeight; c.getContext('2d').drawImage(rv,0,0); }
-    rs.getTracks().forEach(t=>t.stop());
     return c;
-  }catch(e){ console.warn('rear camera',e); return null; }
-  finally{ if(stopped) camOn=await initCam(); }
+  }catch(e){ console.warn('rear camera',e.message||e); return null; }
+  finally{
+    if(rs) rs.getTracks().forEach(t=>t.stop());
+    if(stopped){
+      await sleep(300);
+      try{ camOn=await timeout(initCam(),8000,'front camera reopen'); }catch(e){ console.warn(e.message); camOn=false; }
+    }
+  }
 }
 
 // second look, later in the game, compared with the calibration frame
@@ -1256,8 +1330,8 @@ async function boot(){
   await type('capturing environment for analysis...',{cls:'dim',pause:100});
   const snap=snapshot(); wantSeg=false; S.base=snap.metrics;
   const rl=addLine('  rear sensor ............. checking','dim');
-  snap.rear=await rearSnap();
-  rl.textContent='  rear sensor ............. '+(snap.rear?'captured':'not found');
+  snap.rear=await Promise.race([rearSnap(), sleep(20000).then(()=>null)]);
+  rl.textContent='  rear sensor ............. '+(snap.rear?'captured':location.protocol==='file:'?'unavailable (open the game from a web address, not a file)':'not found');
   analyse(snap);
   addLine('  > frame captured. analysis runs in the background. nothing leaves this computer.','dim');
   addLine('  > first run downloads the scene models. progress is shown top right.','dim');
