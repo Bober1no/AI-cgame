@@ -1,0 +1,1273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NIGHTWATCH</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=VT323&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+<!-- Human: face detection, face mesh, iris, emotion, object detection, body segmentation (runs locally on WebGL) -->
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/human@3.3.6/dist/human.js"></script>
+<style>
+:root{
+  --bg:#050805; --panel:#0a110a; --fg:#a6e3a1; --dim:#58745a; --red:#ff4a3d; --white:#e9efe6;
+  --display:"VT323",ui-monospace,"Courier New",monospace;
+  --body:"IBM Plex Mono",ui-monospace,"Courier New",monospace;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:var(--body)}
+body{overflow:hidden}
+#term{position:fixed;inset:0;overflow-y:auto;padding:24px 16px 190px}
+#out{max-width:760px;margin:0 auto;font-size:15px;line-height:1.6;text-shadow:0 0 6px rgba(140,255,140,.28)}
+.line{white-space:pre-wrap;overflow-wrap:anywhere;min-height:1.6em}
+.dim{color:var(--dim)}
+.red{color:var(--red);text-shadow:0 0 8px rgba(255,60,50,.55)}
+.white{color:var(--white)}
+.big{font-family:var(--display);font-size:clamp(40px,11vw,72px);line-height:1;letter-spacing:.12em;color:var(--white)}
+.hdr{font-family:var(--display);font-size:22px;letter-spacing:.06em;color:var(--white)}
+#choices{position:fixed;left:0;right:0;bottom:0;padding:28px 16px 18px;display:flex;flex-wrap:wrap;gap:10px;justify-content:center;background:linear-gradient(transparent,var(--bg) 32%);z-index:10}
+button{font:inherit;font-size:15px;background:var(--panel);color:var(--fg);border:1px solid var(--dim);padding:11px 16px;cursor:pointer}
+button:hover,button:focus-visible{border-color:var(--fg);background:#0f1c10;outline:none}
+canvas.feed{width:100%;max-width:680px;display:block;border:1px solid var(--dim);background:#000;margin:12px 0}
+#scare{position:fixed;inset:0;z-index:100;background:#000;display:none}
+#scare canvas{width:100%;height:100%;display:block}
+#crt{position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(0,0,0,.3) 0 1px,transparent 1px 3px);z-index:50}
+#vig{position:fixed;inset:0;pointer-events:none;background:radial-gradient(ellipse at center,transparent 55%,rgba(0,0,0,.85));z-index:49}
+.glitch{animation:gl .15s steps(2) 6}
+@keyframes gl{0%{transform:translate(3px,-2px)}50%{transform:translate(-4px,2px)}100%{transform:none}}
+#ai{position:fixed;top:10px;right:12px;z-index:60;font-size:12px;color:var(--dim);background:rgba(5,8,5,.85);border:1px solid #1f2d20;padding:4px 8px;font-variant-numeric:tabular-nums;max-width:calc(100vw - 24px)}
+#ai:empty{display:none}
+@media (prefers-reduced-motion:reduce){.glitch{animation:none}}
+</style>
+</head>
+<body>
+<div id="term"><div id="out"></div></div>
+<div id="choices"></div>
+<div id="ai" aria-live="polite"></div>
+<div id="scare"><canvas></canvas></div>
+<div id="vig"></div><div id="crt"></div>
+
+<script>
+// =====================================================================
+// core text engine
+// =====================================================================
+const out=document.getElementById('out'), term=document.getElementById('term'), choicesEl=document.getElementById('choices');
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const frame=()=>new Promise(r=>requestAnimationFrame(r));
+const lerp=(a,b,t)=>a+(b-a)*Math.max(0,Math.min(1,t));
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+let skip=false, running=false;
+term.addEventListener('pointerdown',()=>skip=true);
+const scrollDown=()=>{ term.scrollTop=term.scrollHeight; };
+function addLine(text,cls=''){ const d=document.createElement('div'); d.className='line '+cls; d.textContent=text; out.appendChild(d); scrollDown(); return d; }
+async function typeRaw(text,{speed=26,cls='',pause=350}={}){
+  skip=false; const line=addLine('',cls);
+  for(const ch of text){ line.textContent+=ch; if(!skip){ if(Math.random()<.5) tick(); await sleep(/[.!?]/.test(ch)?speed*5:ch===','?speed*3:speed); } scrollDown(); }
+  await sleep(skip?120:pause);
+}
+// interjections from the watcher are printed before the next story line
+const pending=[]; let flushing=false, choiceOpen=false;
+async function type(text,opts){
+  if(!flushing && pending.length){ flushing=true; while(pending.length){ glitch(); thump(); await typeRaw(pending.shift(),{cls:'red',speed:16,pause:600}); } flushing=false; }
+  await typeRaw(text,opts);
+}
+function interject(msg){
+  if(choiceOpen){ glitch(); thump(); addLine(msg,'red'); }
+  else pending.push(msg);
+}
+const gap=()=>addLine('');
+function choose(opts){
+  choiceOpen=true;
+  return new Promise(res=>{
+    choicesEl.innerHTML='';
+    opts.forEach((label,i)=>{ const b=document.createElement('button'); b.textContent=`${i+1}. ${label}`;
+      b.onclick=()=>{ blip(); choicesEl.innerHTML=''; window.onkeydown=null; choiceOpen=false; addLine('> '+label,'dim'); res(i); };
+      choicesEl.appendChild(b); });
+    window.onkeydown=e=>{ const n=parseInt(e.key); if(n>=1&&n<=opts.length) choicesEl.children[n-1].click(); };
+  });
+}
+function glitch(){ out.classList.remove('glitch'); void out.offsetWidth; out.classList.add('glitch'); }
+const pad=n=>String(n).padStart(2,'0');
+const nowHM=()=>{ const d=new Date(); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+const timestamp=()=>{ const d=new Date(); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}  ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; };
+const listify=a=>a.length<2?(a[0]||''):a.slice(0,-1).join(', ')+' and '+a[a.length-1];
+const pct=v=>Math.round(v*100)+'%';
+
+// =====================================================================
+// audio
+// =====================================================================
+let A=null, master, droneGain, heartTimer=null;
+function noiseBuf(sec=2){ const b=A.createBuffer(1,A.sampleRate*sec,A.sampleRate), d=b.getChannelData(0); for(let i=0;i<d.length;i++) d[i]=Math.random()*2-1; return b; }
+function initAudio(){
+  if(A) return;
+  try{
+    A=new (window.AudioContext||window.webkitAudioContext)();
+    master=A.createGain(); master.gain.value=.6; master.connect(A.destination);
+    droneGain=A.createGain(); droneGain.gain.value=0; droneGain.connect(master);
+    const lp=A.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=180; lp.connect(droneGain);
+    [55,58.4,82.2].forEach(f=>{ const o=A.createOscillator(); o.type='sawtooth'; o.frequency.value=f; const g=A.createGain(); g.gain.value=.12; o.connect(g).connect(lp); o.start(); });
+    const n=A.createBufferSource(); n.buffer=noiseBuf(); n.loop=true;
+    const bp=A.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=500; bp.Q.value=.7;
+    const ng=A.createGain(); ng.gain.value=.05; n.connect(bp).connect(ng).connect(droneGain); n.start();
+  }catch(e){ A=null; }
+}
+function tension(v,secs=2){ if(!A) return; const t=A.currentTime; droneGain.gain.cancelScheduledValues(t); droneGain.gain.setValueAtTime(droneGain.gain.value,t); droneGain.gain.linearRampToValueAtTime(v,t+secs); }
+function tone(freq,type,gain,dur){ if(!A) return; const t=A.currentTime,o=A.createOscillator(),g=A.createGain(); o.type=type; o.frequency.value=freq; g.gain.setValueAtTime(gain,t); g.gain.exponentialRampToValueAtTime(.0001,t+dur); o.connect(g).connect(master); o.start(t); o.stop(t+dur+.02); }
+const tick=()=>tone(1800+Math.random()*400,'square',.008,.02);
+const blip=()=>tone(660,'sine',.06,.12);
+function thump(){ if(!A) return; [0,.18].forEach((d,i)=>{ const t=A.currentTime+d,o=A.createOscillator(),g=A.createGain(); o.frequency.setValueAtTime(70,t); o.frequency.exponentialRampToValueAtTime(35,t+.15); g.gain.setValueAtTime(i?.35:.5,t); g.gain.exponentialRampToValueAtTime(.001,t+.2); o.connect(g).connect(master); o.start(t); o.stop(t+.25); }); }
+function heartbeat(on,ms=850){ clearInterval(heartTimer); if(on){ thump(); heartTimer=setInterval(thump,ms); } }
+function sting(){
+  if(!A) return; const t=A.currentTime;
+  const n=A.createBufferSource(); n.buffer=noiseBuf(); const g=A.createGain();
+  g.gain.setValueAtTime(1,t); g.gain.exponentialRampToValueAtTime(.001,t+1.6); n.connect(g).connect(master); n.start(t); n.stop(t+1.7);
+  [220,233,311,466,494].forEach(f=>{ const o=A.createOscillator(); o.type='sawtooth'; o.frequency.setValueAtTime(f*2,t); o.frequency.exponentialRampToValueAtTime(f/3,t+1.5);
+    const og=A.createGain(); og.gain.setValueAtTime(.22,t); og.gain.exponentialRampToValueAtTime(.001,t+1.6); o.connect(og).connect(master); o.start(t); o.stop(t+1.7); });
+}
+
+// =====================================================================
+// camera
+// =====================================================================
+let camOn=false, stream=null;
+const video=document.createElement('video'); video.muted=true; video.playsInline=true;
+let frontId=null;
+async function initCam(){
+  try{
+    const vc={width:{ideal:960},height:{ideal:720}};
+    if(frontId) vc.deviceId={exact:frontId}; else vc.facingMode='user';
+    stream=await navigator.mediaDevices.getUserMedia({video:vc,audio:false});
+    frontId=stream.getVideoTracks()[0]?.getSettings().deviceId||frontId;
+    video.srcObject=stream; await video.play();
+    for(let i=0;i<50 && !video.videoWidth;i++) await sleep(100);
+    return !!video.videoWidth;
+  }catch(e){ return false; }
+}
+function killCam(){ if(stream) stream.getTracks().forEach(t=>t.stop()); camOn=false; }
+// cheap whole-frame brightness and pixel motion
+const an=document.createElement('canvas'); an.width=64; an.height=48;
+const anx=an.getContext('2d',{willReadFrequently:true}); let prevG=null;
+function sample(){
+  if(!camOn||video.readyState<2) return {bright:-1,motion:0};
+  anx.drawImage(video,0,0,64,48);
+  const d=anx.getImageData(0,0,64,48).data, g=new Float32Array(64*48); let sum=0,diff=0;
+  for(let i=0;i<g.length;i++){ const v=d[i*4]*.3+d[i*4+1]*.59+d[i*4+2]*.11; g[i]=v; sum+=v; if(prevG) diff+=Math.abs(v-prevG[i]); }
+  const motion=prevG?diff/g.length:0; prevG=g; return {bright:sum/g.length,motion};
+}
+
+// =====================================================================
+// vision layer 1: Human (face box + 468-point mesh + iris + emotion, selfie segmentation)
+// everything runs on this device; models are downloaded once from the CDN
+// =====================================================================
+const MODELS='https://cdn.jsdelivr.net/npm/@vladmandic/human@3.3.6/models/';
+const SEG_MODEL='https://cdn.jsdelivr.net/gh/vladmandic/human-models@main/models/selfie.json';
+let human=null; const has={face:false,seg:false};
+const V={
+  faces:[], face:null, lastFaceAt:0, firstFaceAt:0, faceSeenMs:0,
+  yaw:0, pitch:0, emo:{}, fear:0, peakFear:0, peakFearEmo:'',
+  open:1, openBase:0, closed:false, closedAt:0, blinks:0,
+  center:null, moveEMA:0,
+  mask:null, maskAt:0,
+  awayCount:0, outMs:0, extraSeen:0,
+};
+const maskC=document.createElement('canvas'), maskX=maskC.getContext('2d');
+
+async function loadVision(report){
+  if(human && has.face){ report('face topology network ......... online'); return true; }
+  if(!window.Human){ report('vision library unreachable. are you offline?','red'); return false; }
+  try{
+    human=new Human.Human({
+      modelBasePath:MODELS, backend:'webgl', debug:false, warmup:'none', cacheSensitivity:0, async:true,
+      filter:{enabled:true,equalization:false,flip:false},
+      face:{enabled:true,
+        detector:{rotation:false,maxDetected:4,minConfidence:.3,return:false},
+        mesh:{enabled:true}, iris:{enabled:true}, attention:{enabled:false},
+        emotion:{enabled:true,minConfidence:.05},
+        description:{enabled:false}, antispoof:{enabled:false}, liveness:{enabled:false}},
+      body:{enabled:false}, hand:{enabled:false}, gesture:{enabled:false},
+      segmentation:{enabled:false,modelPath:SEG_MODEL},
+    });
+    await human.load(); has.face=true;
+    report('face topology network ......... online');
+  }catch(e){ console.warn(e); report('face network failed to load.','red'); return false; }
+  try{ human.config.segmentation.enabled=true; await human.load(); has.seg=true; report('body segmentation ............. online'); }
+  catch(e){ console.warn(e); report('body segmentation ............. offline','dim'); }
+  human.config.segmentation.enabled=false;
+  return true;
+}
+
+// convert video-space coords to the mirrored canvas
+function toCanvas(x,y,W,H){ return [W - x*W/video.videoWidth, y*H/video.videoHeight]; }
+
+async function scanFace(){
+  const r=await human.detect(video);
+  const now=performance.now();
+  const faces=(r.face||[]).filter(f=>f.score>.35).sort((a,b)=>b.box[2]*b.box[3]-a.box[2]*a.box[3]);
+  V.faces=faces;
+  const f=faces[0]||null;
+  if(f){
+    const dt=V.lastFaceAt?Math.min(now-V.lastFaceAt,250):0;
+    V.faceSeenMs+=dt; if(!V.firstFaceAt) V.firstFaceAt=now;
+    V.lastFaceAt=now; V.face=f;
+    const [x,y,w,h]=f.box, c=[x+w/2,y+h/2];
+    if(V.center){ const d=Math.hypot(c[0]-V.center[0],c[1]-V.center[1])/w; V.moveEMA=V.moveEMA*.6+d*.4; }
+    V.center=c;
+    V.yaw=f.rotation?.angle?.yaw??0; V.pitch=f.rotation?.angle?.pitch??0;
+    V.emo={}; (f.emotion||[]).forEach(e=>V.emo[e.emotion]=e.score);
+    V.fear=Math.max(V.emo.fear||0,(V.emo.surprise||0)*.8);
+    if(V.fear>V.peakFear){ V.peakFear=V.fear; V.peakFearEmo=(V.emo.fear||0)>=(V.emo.surprise||0)?'fear':'surprise'; }
+    // eye openness from mesh (lid gap relative to eye-region height), same landmarks Human uses for blinks
+    const m=f.mesh;
+    if(m && m.length>=468){
+      const l=Math.abs(m[374][1]-m[386][1])/Math.max(1,Math.abs(m[443][1]-m[450][1]));
+      const rr=Math.abs(m[145][1]-m[159][1])/Math.max(1,Math.abs(m[223][1]-m[230][1]));
+      const o=(l+rr)/2; V.open=o;
+      if(!V.closed) V.openBase = V.openBase ? V.openBase*.97+o*.03 : o;
+      const shut = V.openBase>0 && o < V.openBase*.55;
+      if(shut && !V.closed){ V.closed=true; V.closedAt=now; }
+      else if(!shut && V.closed){ V.closed=false; const dur=now-V.closedAt; if(dur>40 && dur<700) V.blinks++; V.reopenedAt=now; }
+    }
+  } else {
+    V.face=null; V.center=null;
+  }
+}
+async function segment(){
+  human.config.segmentation.enabled=true;
+  let t=null;
+  try{ t=await human.segmentation(video); }finally{ human.config.segmentation.enabled=false; }
+  if(!t) return;
+  const shape=t.shape, h=shape[shape.length-3], w=shape[shape.length-2], ch=shape[shape.length-1];
+  const data=await t.data(); human.tf.dispose(t);
+  if(maskC.width!==w||maskC.height!==h){ maskC.width=w; maskC.height=h; }
+  const img=maskX.createImageData(w,h), px=img.data;
+  for(let i=0,n=w*h;i<n;i++){
+    let a = ch===4 ? data[i*4+3] : data[i*ch];
+    if(a<=1.0001 && ch!==4) a*=255;
+    px[i*4]=px[i*4+1]=px[i*4+2]=255; px[i*4+3]=a;
+  }
+  maskX.putImageData(img,0,0); V.mask=maskC; V.maskAt=performance.now();
+}
+
+// one scheduler so the GPU never runs two models at once
+let visionOn=false, wantSeg=false, segEvery=120, lastSeg=0, segTurn=false;
+const faceFresh=(ms=2500)=>V.face && performance.now()-V.lastFaceAt<ms;
+async function visionLoop(){
+  while(visionOn){
+    const now=performance.now();
+    try{
+      if(has.seg && wantSeg && segTurn && now-lastSeg>segEvery){ await segment(); lastSeg=performance.now(); }
+      else await scanFace();
+      segTurn=!segTurn;
+    }catch(e){ console.warn(e); await sleep(200); }
+    watcher();
+    await frame();
+  }
+}
+
+// =====================================================================
+// the watcher: reacts to what the camera sees while the story runs
+// =====================================================================
+let watching=false; const W8={away:0,awayStart:0,lastAway:0,outStart:0,lastOut:0,extraStart:0,extraDone:false,smileStart:0,smileDone:false,fearDone:false};
+function watcher(){
+  if(!camOn||!has.face) return;
+  const now=performance.now();
+  const present = now-V.lastFaceAt < 1000;
+  // time out of frame (always counted while running)
+  if(running){ if(!present){ if(!W8.outStart) W8.outStart=now; } else if(W8.outStart){ V.outMs+=now-W8.outStart; W8.outStart=0; } }
+  if(!watching) return;
+  if(!present && W8.outStart && now-W8.outStart>3500 && now-W8.lastOut>40000){ W8.lastOut=now; interject('you left the frame. it\'s still in it.'); }
+  const away = present && Math.abs(V.yaw)>.55;
+  if(away){ if(!W8.awayStart) W8.awayStart=now; } else W8.awayStart=0;
+  if(W8.awayStart && now-W8.awayStart>1200 && now-W8.lastAway>30000 && W8.away<3){ W8.lastAway=now; W8.away++; V.awayCount++; interject(pickOne(['eyes on the screen.','don\'t look over there. it\'s not over there.','look back at the screen. now.'])); }
+  if(V.faces.length>=2){ if(!W8.extraStart) W8.extraStart=now; V.extraSeen=Math.max(V.extraSeen,V.faces.length-1); } else W8.extraStart=0;
+  if(!W8.extraDone && W8.extraStart && now-W8.extraStart>900){ W8.extraDone=true; interject('who is that next to you?'); }
+  if((V.emo.happy||0)>.7 && present){ if(!W8.smileStart) W8.smileStart=now; } else W8.smileStart=0;
+  if(!W8.smileDone && W8.smileStart && now-W8.smileStart>1200){ W8.smileDone=true; interject('something funny?'); }
+  if(!W8.fearDone && V.fear>.45 && present){ W8.fearDone=true; interject(`fear response detected. ${pct(V.fear)}. it can tell.`); }
+}
+const pickOne=a=>a[Math.random()*a.length|0];
+
+// =====================================================================
+// rendering a live CCTV feed (with optional analysis HUD and the figure)
+// =====================================================================
+const feeds=[];
+const fig={p:0,on:false,side:1,hidden:false};
+let hud=false;
+function makeFeed(label){
+  const c=document.createElement('canvas'); c.className='feed';
+  const vw=video.videoWidth||640, vh=video.videoHeight||480;
+  c.width=720; c.height=Math.round(720*vh/vw);
+  out.appendChild(c); scrollDown();
+  const f={c,ctx:c.getContext('2d'),label,live:true,raf:0};
+  const off=document.createElement('canvas'); off.width=c.width; off.height=c.height; f.off=off; f.offx=off.getContext('2d');
+  const loop=now=>{ if(!f.live) return; drawFeed(f,now); f.raf=requestAnimationFrame(loop); };
+  f.raf=requestAnimationFrame(loop); feeds.push(f); return f;
+}
+function closeFeed(f,msg='SIGNAL CLOSED'){
+  f.live=false; cancelAnimationFrame(f.raf);
+  const {ctx,c}=f; ctx.fillStyle='rgba(0,0,0,.65)'; ctx.fillRect(0,0,c.width,c.height);
+  ctx.fillStyle='#fff'; ctx.font='bold 22px "IBM Plex Mono",monospace'; ctx.textAlign='center'; ctx.fillText(msg,c.width/2,c.height/2); ctx.textAlign='left';
+}
+function drawVideo(ctx,W,H,filter){
+  ctx.save(); ctx.filter=filter; ctx.translate(W,0); ctx.scale(-1,1); ctx.drawImage(video,0,0,W,H); ctx.restore();
+}
+function faceRect(f,W,H){ const [x,y,w,h]=f.box; const [x1,y1]=toCanvas(x+w,y,W,H); return {x:x1,y:y1,w:w*W/video.videoWidth,h:h*H/video.videoHeight}; }
+function drawFeed(f,now){
+  const {ctx,c}=f, W=c.width, H=c.height;
+  const camOk=camOn && video.readyState>=2;
+  const FILTER='grayscale(1) contrast(1.35) brightness(.72)';
+  if(camOk) drawVideo(ctx,W,H,FILTER); else { ctx.fillStyle='#0c0c0c'; ctx.fillRect(0,0,W,H); }
+  // the figure, layered behind the player when segmentation is live
+  if(fig.on && !fig.hidden && Math.random()>.08){
+    drawFigure(ctx,W,H);
+    const maskFresh = V.mask && now-V.maskAt<700;
+    if(camOk && maskFresh){
+      const o=f.offx; o.globalCompositeOperation='source-over'; o.clearRect(0,0,W,H);
+      drawVideo(o,W,H,FILTER);
+      o.globalCompositeOperation='destination-in';
+      o.save(); o.translate(W,0); o.scale(-1,1); o.drawImage(V.mask,0,0,W,H); o.restore();
+      o.globalCompositeOperation='source-over';
+      ctx.drawImage(f.off,0,0);
+    }
+  }
+  if(hud && camOk) drawHUD(ctx,W,H);
+  const heavy=!camOk;
+  for(let i=0;i<(heavy?5000:900);i++){ const v=Math.random()*255|0; ctx.fillStyle=`rgba(${v},${v},${v},${heavy?.9:.2})`; ctx.fillRect(Math.random()*W,Math.random()*H,2,2); }
+  if(Math.random()<.06){ const y=Math.random()*(H-24); ctx.drawImage(c,0,y,W,22,(Math.random()-.5)*40,y,W,22); }
+  ctx.font='bold 16px "IBM Plex Mono",monospace'; ctx.fillStyle='#fff';
+  ctx.fillText(f.label,14,26);
+  if((now/500|0)%2){ ctx.fillStyle='#f33'; ctx.beginPath(); ctx.arc(W-72,21,6,0,7); ctx.fill(); }
+  ctx.fillStyle='#fff'; ctx.fillText('REC',W-60,26); ctx.fillText(timestamp(),14,H-16);
+}
+function brackets(ctx,x,y,w,h,len){
+  ctx.beginPath();
+  [[x,y,1,1],[x+w,y,-1,1],[x,y+h,1,-1],[x+w,y+h,-1,-1]].forEach(([px,py,sx,sy])=>{ ctx.moveTo(px+sx*len,py); ctx.lineTo(px,py); ctx.lineTo(px,py+sy*len); });
+  ctx.stroke();
+}
+function drawHUD(ctx,W,H){
+  ctx.save(); ctx.font='12px "IBM Plex Mono",monospace'; ctx.lineWidth=1.5;
+  // objects
+  for(const o of S.regions){
+    const [x,y,w,h]=o.box, [x1,y1]=toCanvas(x+w,y,W,H), bw=w*W/video.videoWidth, bh=h*H/video.videoHeight;
+    ctx.strokeStyle='rgba(255,255,255,.5)'; ctx.setLineDash([4,4]); ctx.strokeRect(x1,y1,bw,bh); ctx.setLineDash([]);
+    ctx.fillStyle='rgba(255,255,255,.85)'; ctx.fillText(o.label.toUpperCase().slice(0,28),x1+4,y1+14);
+  }
+  if(S.place){ ctx.fillStyle='rgba(255,255,255,.85)'; ctx.fillText(`LOCATION: ${S.place.name.toUpperCase()} ${pct(S.place.score)}`,14,H-40); }
+  // faces
+  V.faces.forEach((fc,i)=>{
+    const r=faceRect(fc,W,H);
+    ctx.strokeStyle=i===0?'rgba(255,70,60,.95)':'rgba(255,200,60,.95)';
+    brackets(ctx,r.x,r.y,r.w,r.h,Math.min(18,r.w/4));
+    ctx.fillStyle=ctx.strokeStyle;
+    ctx.fillText(i===0?`SUBJECT 01  ${pct(fc.score)}`:`UNKNOWN ${pad(i+1)}`,r.x,r.y-6);
+    if(i===0 && fc.mesh){
+      ctx.fillStyle='rgba(255,70,60,.55)';
+      for(let k=0;k<fc.mesh.length;k+=2){ const [px,py]=toCanvas(fc.mesh[k][0],fc.mesh[k][1],W,H); ctx.fillRect(px,py,1.6,1.6); }
+    }
+  });
+  // readout
+  if(V.face){
+    const top=Object.entries(V.emo).sort((a,b)=>b[1]-a[1]).slice(0,3);
+    const lines=[
+      `GAZE    ${Math.abs(V.yaw)>.55?'AWAY':'SCREEN'}  yaw ${Math.round(V.yaw*57.3)}°`,
+      `EYES    ${V.closed?'CLOSED':'OPEN'}  blinks ${V.blinks}`,
+      `FEAR    ${pct(V.fear)}`,
+      ...top.map(([k,v])=>`${k.toUpperCase().padEnd(8)}${pct(v)}`)
+    ];
+    const bx=W-200, by=44;
+    ctx.fillStyle='rgba(0,0,0,.55)'; ctx.fillRect(bx-8,by-14,196,lines.length*16+10);
+    ctx.fillStyle='rgba(255,90,80,.95)'; lines.forEach((l,i)=>ctx.fillText(l,bx,by+i*16));
+  }
+  ctx.restore();
+}
+function drawFigure(ctx,W,H){
+  const p=fig.p; let cx,top,hr;
+  const f=faceFresh() ? faceRect(V.face,W,H) : null;
+  if(f){
+    const fw=f.w, far=clamp(fw*2.4,W*.22,W*.4);
+    hr=fw*lerp(.26,.6,p);
+    cx=f.x+f.w/2 + fig.side*lerp(far,fw*1.0,p);
+    top=f.y + f.h*lerp(-.15,-.35,p);
+  } else {
+    hr=34*lerp(.5,1.25,p); cx=W*lerp(.82,.66,p); if(fig.side<0) cx=W-cx; top=H*lerp(.3,.1,p);
+  }
+  cx=clamp(cx,hr,W-hr);
+  ctx.save();
+  ctx.filter=`blur(${lerp(3,1.1,p)}px)`;
+  ctx.fillStyle=`rgba(0,0,0,${lerp(.55,.9,p)})`;
+  ctx.beginPath(); ctx.ellipse(cx,top+hr,hr*.8,hr*1.15,0,0,7); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(cx-hr*.35,top+hr*1.9); ctx.lineTo(cx-hr*.4,top+hr*2.6);
+  ctx.quadraticCurveTo(cx-hr*2.7,top+hr*2.9,cx-hr*3,H); ctx.lineTo(cx+hr*3,H);
+  ctx.quadraticCurveTo(cx+hr*2.7,top+hr*2.9,cx+hr*.4,top+hr*2.6); ctx.lineTo(cx+hr*.35,top+hr*1.9); ctx.closePath(); ctx.fill();
+  if(p>.4){ ctx.filter='none'; ctx.fillStyle=`rgba(255,255,255,${lerp(.3,.85,(p-.4)/.6)})`;
+    const e=Math.max(1.5,hr*.07); ctx.fillRect(cx-hr*.38,top+hr*.85,e*1.6,e); ctx.fillRect(cx+hr*.22,top+hr*.85,e*1.6,e); }
+  ctx.restore();
+}
+function placeFigure(){
+  // put it on whichever side of you has more room
+  const W=720;
+  if(V.face){ const r=faceRect(V.face,W,W*video.videoHeight/video.videoWidth); fig.side = (r.x+r.w/2) > W/2 ? -1 : 1; }
+  else fig.side=1;
+}
+
+// =====================================================================
+// jumpscare: your own face, locked on with the mesh, eyes and mouth hollowed out
+// =====================================================================
+function poly(ctx,pts,scaleX,scaleY,anchorTop=false){
+  let cx=0,cy=0; pts.forEach(p=>{cx+=p[0];cy+=p[1];}); cx/=pts.length; cy/=pts.length;
+  const minY=Math.min(...pts.map(p=>p[1]));
+  ctx.beginPath();
+  pts.forEach((p,i)=>{ const x=cx+(p[0]-cx)*scaleX, y=anchorTop? minY+(p[1]-minY)*scaleY : cy+(p[1]-cy)*scaleY; i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+  ctx.closePath(); ctx.fill();
+}
+async function jumpscare(){
+  const sc=document.getElementById('scare'), c=sc.querySelector('canvas');
+  c.width=innerWidth; c.height=innerHeight; const ctx=c.getContext('2d'), w=c.width, h=c.height;
+  sc.style.display='block'; sting(); wantSeg=false;
+  const start=performance.now(), end=start+1800;
+  const react={start, c0:V.center?[...V.center]:null, flinch:0, emo:{}};
+  await new Promise(res=>{
+    const f=now=>{
+      ctx.setTransform(1,0,0,1,(Math.random()-.5)*50,(Math.random()-.5)*50);
+      ctx.fillStyle='#000'; ctx.fillRect(-60,-60,w+120,h+120);
+      const face=faceFresh(3000) ? V.face : null;
+      if(camOn && video.readyState>=2){
+        const vw=video.videoWidth, vh=video.videoHeight;
+        let k, fx=vw/2, fy=vh/2;
+        if(face){ const [x,y,bw,bh]=face.box; fx=x+bw/2; fy=y+bh/2; k=(h*.75)/bh; } else k=Math.max(w/vw,h/vh)*1.35;
+        // map video point -> screen (mirrored, centred on the face)
+        const map=(x,y)=>[w/2-(x-fx)*k, h/2+(y-fy)*k];
+        ctx.save(); ctx.filter='grayscale(1) contrast(2.6) brightness(.8)';
+        ctx.translate(w/2+fx*k,h/2-fy*k); ctx.scale(-k,k); ctx.drawImage(video,0,0); ctx.restore();
+        if(face?.annotations){
+          const A=face.annotations, M=pts=>pts.map(p=>map(p[0],p[1]));
+          ctx.fillStyle='#000';
+          for(const [up,low] of [['leftEyeUpper0','leftEyeLower0'],['rightEyeUpper0','rightEyeLower0']]){
+            if(A[up]&&A[low]){ poly(ctx,M([...A[up],...[...A[low]].reverse()]),1.9,3.2); }
+          }
+          if(A.lipsUpperOuter&&A.lipsLowerOuter) poly(ctx,M([...A.lipsUpperOuter,...[...A.lipsLowerOuter].reverse()]),1.15,4.5,true);
+          ctx.fillStyle='rgba(255,255,255,.9)';
+          for(const k2 of ['leftEyeIris','rightEyeIris']){ const ir=A[k2]; if(ir&&ir[0]){ const [px,py]=map(ir[0][0],ir[0][1]); ctx.beginPath(); ctx.arc(px,py,Math.max(2,w*.004),0,7); ctx.fill(); } }
+        }
+        ctx.globalCompositeOperation='multiply'; ctx.fillStyle='#ff1a1a'; ctx.fillRect(-60,-60,w+120,h+120); ctx.globalCompositeOperation='source-over';
+      } else {
+        for(let i=0;i<6000;i++){ const v=Math.random()*255|0; ctx.fillStyle=`rgb(${v},${v*.2|0},${v*.2|0})`; ctx.fillRect(Math.random()*w,Math.random()*h,4,4); }
+      }
+      ctx.font=`${Math.min(w,h)*.17}px "VT323",monospace`; ctx.textAlign='center';
+      ctx.lineWidth=8; ctx.strokeStyle='#000'; ctx.strokeText('FOUND YOU',w/2,h*.9);
+      ctx.fillStyle='#fff'; ctx.fillText('FOUND YOU',w/2,h*.9);
+      // reaction tracking
+      if(V.center && react.c0 && V.face){ const d=Math.hypot(V.center[0]-react.c0[0],V.center[1]-react.c0[1])/V.face.box[2]; react.flinch=Math.max(react.flinch,d); }
+      for(const [k3,v] of Object.entries(V.emo)) react.emo[k3]=Math.max(react.emo[k3]||0,v);
+      now<end?requestAnimationFrame(f):res();
+    };
+    requestAnimationFrame(f);
+  });
+  sc.style.display='none';
+  // keep watching for another second after it ends
+  const t0=performance.now();
+  while(performance.now()-t0<1200){ for(const [k3,v] of Object.entries(V.emo)) react.emo[k3]=Math.max(react.emo[k3]||0,v); if(V.center&&react.c0&&V.face){ const d=Math.hypot(V.center[0]-react.c0[0],V.center[1]-react.c0[1])/V.face.box[2]; react.flinch=Math.max(react.flinch,d);} await sleep(50); }
+  return react;
+}
+
+// =====================================================================
+// helpers that read the room
+// =====================================================================
+// =====================================================================
+// vision layer 2: scene understanding (transformers.js, runs in this browser)
+//  - CLIP ViT-B/16: zero-shot answers to any question phrased as text labels
+//  - Florence-2: a written description of the frame and labelled regions
+// =====================================================================
+const TJS='https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1/dist/transformers.min.js';
+const S={state:'idle', place:null, behind:null, cloth:null, clothColour:null, wall:null, hairLen:null, hairColour:null,
+  glasses:false, headphones:false, hat:null, caption:'', faceCaption:'', regions:[], items:[], announced:false,
+  facialHair:null, eyes:null, faceShape:null, brows:null, freckles:false, piercing:false, log:[], rawCaption:'', rawFace:'', rawRegions:'', lines:[], frontList:[], behindList:[], frontCaption:'', base:null, q:null, hairText:''};
+const AI={T:null, clip:null, fl:null, flProc:null, files:new Map(), loading:null};
+const aiEl=document.getElementById('ai');
+function aiStatus(t){ aiEl.textContent=t?('SCENE AI · '+t):''; }
+function aiProgress(d){
+  if(d.status==='progress' && d.total){ AI.files.set(d.name+'/'+d.file,{l:d.loaded,t:d.total}); }
+  else if(d.status==='done'){ const f=AI.files.get(d.name+'/'+d.file); if(f) f.l=f.t; }
+  else return;
+  let l=0,t=0; for(const f of AI.files.values()){ l+=f.l; t+=f.t; }
+  if(t) aiStatus(`downloading ${Math.floor(l/t*100)}%  ${Math.round(l/1048576)}/${Math.round(t/1048576)}MB`);
+}
+
+// file:// pages often can't use the Cache API, so fall back to IndexedDB to avoid re-downloading every run
+const idbCache={
+  db:null,
+  open(){ return this.db ||= new Promise((res,rej)=>{ const r=indexedDB.open('nightwatch-models',1); r.onupgradeneeded=()=>r.result.createObjectStore('f'); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); },
+  async match(key){
+    try{ const db=await this.open(); const v=await new Promise(res=>{ const q=db.transaction('f').objectStore('f').get(String(key)); q.onsuccess=()=>res(q.result); q.onerror=()=>res(undefined); });
+      return v ? new Response(v.blob,{headers:{'content-type':v.type||'application/octet-stream','content-length':String(v.blob.size)}}) : undefined; }
+    catch(e){ return undefined; }
+  },
+  async put(key,response){
+    try{ const blob=await response.blob(); const db=await this.open();
+      await new Promise(res=>{ const t=db.transaction('f','readwrite'); t.objectStore('f').put({blob,type:response.headers.get('content-type')},String(key)); t.oncomplete=res; t.onerror=res; t.onabort=res; }); }
+    catch(e){}
+  }
+};
+async function hasWebGPU(){ try{ return !!(navigator.gpu && await navigator.gpu.requestAdapter()); }catch(e){ return false; } }
+
+function loadAI(){
+  return AI.loading ||= (async()=>{
+    aiStatus('loading library');
+    try{ AI.T=await import(TJS); }catch(e){ console.warn(e); aiStatus('offline'); return false; }
+    const T=AI.T;
+    T.env.allowLocalModels=false;
+    let browserCache=false; try{ await caches.open('nw-test'); browserCache=true; }catch(e){}
+    if(!browserCache){ T.env.useBrowserCache=false; T.env.useCustomCache=true; T.env.customCache=idbCache; }
+    const gpu=await hasWebGPU();
+    // CLIP: small, structured answers
+    for(const id of ['Xenova/clip-vit-base-patch16','Xenova/clip-vit-base-patch32']){
+      try{ AI.clip=await T.pipeline('zero-shot-image-classification',id,{device:'wasm',dtype:'q8',progress_callback:aiProgress}); break; }
+      catch(e){ console.warn('clip',id,e); }
+    }
+    // Florence-2: captions + labelled regions
+    const fid='onnx-community/Florence-2-base-ft';
+    const tries=[...(gpu?[{device:'webgpu',dtype:{embed_tokens:'fp16',vision_encoder:'fp16',encoder_model:'q4',decoder_model_merged:'q4'}}]:[]),
+                 {device:'wasm',dtype:'q8'},{device:'wasm',dtype:'fp32'}];
+    for(const o of tries){
+      try{ AI.fl=await T.Florence2ForConditionalGeneration.from_pretrained(fid,{...o,progress_callback:aiProgress}); AI.flDevice=o.device; break; }
+      catch(e){ console.warn('florence',o.device,e); }
+    }
+    if(AI.fl){ try{ AI.flProc=await T.AutoProcessor.from_pretrained(fid); }catch(e){ console.warn(e); AI.fl=null; } }
+    // Qwen3.5: vision-language model for the descriptions and the entity's lines. WebGPU only.
+    // 2B first (much smarter), 0.8B if the GPU can't fit it. thinking stays off.
+    if(gpu && T.Qwen3_5ForConditionalGeneration){
+      const ids=(navigator.deviceMemory&&navigator.deviceMemory<=4)?['onnx-community/Qwen3.5-0.8B-ONNX-OPT']:['onnx-community/Qwen3.5-2B-ONNX-OPT','onnx-community/Qwen3.5-0.8B-ONNX-OPT'];
+      for(const qid of ids){
+        try{
+          AI.qwProc=await T.AutoProcessor.from_pretrained(qid);
+          AI.qw=await T.Qwen3_5ForConditionalGeneration.from_pretrained(qid,{device:'webgpu',dtype:{embed_tokens:'q4',vision_encoder:'fp16',decoder_model_merged:'q4'},progress_callback:aiProgress});
+          AI.qwName=qid.includes('2B')?'qwen 2b':'qwen 0.8b';
+          break;
+        }catch(e){ console.warn('qwen',qid,e); AI.qw=null; AI.qwProc=null; }
+      }
+    }
+    aiStatus(AI.clip||AI.fl||AI.qw?'models ready':'offline');
+    return !!(AI.clip||AI.fl||AI.qw);
+  })();
+}
+
+const fixArticle=t=>t.replace(/\b(a|an) ([a-z])/gi,(m,a,c)=>(/[aeiou]/i.test(c)?(a[0]==='A'?'An':'an'):(a[0]==='A'?'A':'a'))+' '+c);
+
+// label sets: [CLIP label, what the game calls it]
+const PLACES=[['a classroom','classroom'],['a school hallway with lockers','school hallway'],['a lecture hall','lecture hall'],['a library','library'],['a bedroom','bedroom'],['a living room','living room'],['a home office desk','home office'],['an office','office'],['a kitchen','kitchen'],['a cafe','cafe'],['the inside of a car','car'],['the inside of a bus or train','bus'],['a bathroom','bathroom'],['outdoors','outside'],['a gaming setup with RGB lights','gaming setup']];
+const PLACE_LINE={
+  'classroom':'a classroom. lots of people around you. none of them can see it. only you can.',
+  'school hallway':'a school hallway. long, echoing, and somehow emptier than it should be.',
+  'lecture hall':'a lecture hall. so many seats behind you. not all of them are empty.',
+  'library':'a library. very quiet. quiet enough that it can hear you breathing.',
+  'bedroom':'your bedroom. the one room you thought was safe.',
+  'living room':'the living room. everyone else is asleep, right?',
+  'home office':'your desk. you sit here every day. it\'s been sitting here too.',
+  'office':'an office. nobody else working this late? listen. someone is.',
+  'kitchen':'the kitchen. the light\'s always on in a kitchen at night. it doesn\'t help.',
+  'cafe':'a cafe. lots of people around. none of them are looking at you. one of them is.',
+  'car':'you\'re in a car. check the back seat. actually, don\'t.',
+  'bus':'public transport. count the passengers. now count them again.',
+  'bathroom':'a bathroom. mirrors everywhere. don\'t look in them.',
+  'outside':'you\'re outside. it\'s a lot bigger out there.',
+  'gaming setup':'nice setup. all those lights, and still so many shadows.',
+};
+const BEHIND=[['lockers','the lockers',1],['a bookshelf','the bookshelf'],['a window','the window'],['a door','the door'],['a whiteboard','the whiteboard'],['a chalkboard','the chalkboard'],['a wardrobe','the wardrobe'],['curtains','the curtains',1],['posters on a wall','the posters',1],['a bed','the bed'],['a plain empty wall','the wall'],['a TV','the TV'],['kitchen cabinets','the cabinets',1],['a fridge','the fridge'],['shelves','the shelves',1],['a mirror','the mirror'],['a painting','the painting'],['plants','the plants',1],['a staircase','the stairs',1],['rows of desks','the desks',1],['other people sitting behind','the people behind you',1],['a projector screen','the projector screen'],['a noticeboard','the noticeboard']];
+const BEHIND_LINE={
+  'the mirror':'the mirror behind you. don\'t look in it. it\'s already looking out.',
+  'the window':'the window behind you. it\'s dark out there. something\'s looking in.',
+  'the people behind you':'the people behind you. count them. now count them again.',
+  'the wall':'the wall behind you. it\'s closer than it was a minute ago.',
+  'the door':'the door behind you. is it open? don\'t check.',
+};
+const CLOTHES=[['a school uniform','school uniform'],['a hoodie','hoodie'],['a t-shirt','t-shirt'],['a collared shirt','collared shirt'],['a jumper or sweater','jumper'],['a jacket','jacket'],['a blazer','blazer'],['a puffer jacket','puffer jacket'],['a sports jersey','jersey'],['a tank top','tank top'],['a dress','dress']];
+const COLOURS=['black','white','grey','navy blue','light blue','blue','green','dark green','red','maroon','yellow','beige','brown','pink','purple','orange'];
+const WALLS=[...COLOURS,'cream','off-white'];
+const HAIRLEN=[['short hair','short'],['long hair','long'],['curly hair','curly'],['a buzz cut','buzzed'],['hair tied back in a ponytail or bun','tied-back']];
+const FACIALHAIR=[['a clean-shaven face','clean-shaven'],['light stubble','stubble'],['a moustache','moustache'],['a full beard','beard'],['a goatee','goatee']];
+const EYECOL=[['dark brown eyes','dark brown'],['light brown eyes','light brown'],['blue eyes','blue'],['green eyes','green'],['hazel eyes','hazel'],['grey eyes','grey']];
+const FACESHAPE=[['a round face','round'],['an oval face','oval'],['a square jaw','square-jawed'],['a long narrow face','long'],['a heart-shaped face','heart-shaped']];
+const BROWS=[['thick eyebrows','thick'],['thin eyebrows','thin'],['bushy eyebrows','bushy'],['arched eyebrows','arched'],['straight eyebrows','straight']];
+const HAIRCOL=[['black hair','black'],['dark brown hair','dark brown'],['light brown hair','light brown'],['blonde hair','blonde'],['red hair','red'],['grey hair','grey'],['brightly dyed hair','dyed']];
+
+function cropCanvas(src,x,y,w,h){
+  x=clamp(x,0,src.width); y=clamp(y,0,src.height); w=clamp(w,1,src.width-x); h=clamp(h,1,src.height-y);
+  const c=document.createElement('canvas'); c.width=Math.round(w); c.height=Math.round(h); c.getContext('2d').drawImage(src,x,y,w,h,0,0,c.width,c.height); return c;
+}
+// freeze one frame (plus the body mask) for the heavy models
+function snapshot(){
+  const vw=video.videoWidth, vh=video.videoHeight;
+  const frame=document.createElement('canvas'); frame.width=vw; frame.height=vh; frame.getContext('2d').drawImage(video,0,0);
+  const bg=document.createElement('canvas'); bg.width=vw; bg.height=vh; const b=bg.getContext('2d');
+  b.drawImage(frame,0,0);
+  const face=V.face?[...V.face.box]:null;
+  if(V.mask){ b.globalCompositeOperation='destination-out'; b.drawImage(V.mask,0,0,vw,vh); b.globalCompositeOperation='destination-over'; b.fillStyle='#777'; b.fillRect(0,0,vw,vh); b.globalCompositeOperation='source-over'; }
+  else if(face){ const [x,y,w,h]=face; b.fillStyle='#777'; b.fillRect(x-w*.7,y-h*.4,w*2.4,vh); }
+  let torso=null, head=null, faceC=null;
+  if(face){
+    const [x,y,w,h]=face;
+    faceC=cropCanvas(frame,x-w*.12,y-h*.12,w*1.24,h*1.24);
+    if(vh-(y+h*1.05)>h*.35) torso=cropCanvas(frame,x-w*.7,y+h*1.05,w*2.4,Math.min(h*1.4,vh-(y+h*1.05)));
+    head=cropCanvas(frame,x-w*.35,y-h*.6,w*1.7,h*1.75);
+  }
+  const metrics={bright:meanBright(frame), faces:V.faces.length, fw:face?face[2]/vw:null, cx:face?(face[0]+face[2]/2)/vw:null};
+  return {frame,bg,torso,head,faceC,face,metrics};
+}
+function meanBright(c){
+  const t=document.createElement('canvas'); t.width=32; t.height=24; const x=t.getContext('2d'); x.drawImage(c,0,0,32,24);
+  const d=x.getImageData(0,0,32,24).data; let s=0; for(let i=0;i<d.length;i+=4) s+=d[i]*.3+d[i+1]*.59+d[i+2]*.11; return s/(d.length/4);
+}
+// every CLIP question is logged with its top 3 answers, for the raw dump
+const disp=x=>Array.isArray(x)?x[1]:x;
+const clothText=()=>S.cloth?(S.clothColour?`${S.clothColour} ${S.cloth}`:S.cloth):'';
+const hairText=()=>S.hairText||(S.hairLen&&S.hairColour?`${S.hairLen} ${S.hairColour} hair`:'');
+async function ask(canvas,set,tmpl,name){
+  const labels=set.map(x=>Array.isArray(x)?x[0]:x);
+  const r=await AI.clip(AI.T.RawImage.fromCanvas(canvas),labels,{hypothesis_template:tmpl});
+  const top=r[0], item=set[labels.indexOf(top.label)];
+  if(name) S.log.push(`[clip] ${name.padEnd(13)} ${r.slice(0,3).map(o=>`${disp(set[labels.indexOf(o.label)])} ${pct(o.score)}`).join(' | ')}`);
+  return {item, score:top.score};
+}
+async function yes(canvas,a,b,name){ const r=await ask(canvas,[[a,'yes'],[b,'no']],'a photo of {}',name); return r.item[1]==='yes' && r.score>.62; }
+async function qwen(canvas,question,{max=140,sample=false,temp=.8}={}){
+  const img=await AI.T.RawImage.fromCanvas(canvas).resize(448,448);
+  // non-thinking: the assistant turn opens with an empty think block
+  const prompt=`<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>${question}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`;
+  const inputs=await AI.qwProc(prompt,img);
+  const out=await AI.qw.generate({...inputs,max_new_tokens:max,repetition_penalty:1.1,
+    ...(sample?{do_sample:true,temperature:temp,top_p:.9}:{do_sample:false})});
+  const seq=out.sequences||out;
+  let t=AI.qwProc.batch_decode(seq,{skip_special_tokens:false})[0]||'';
+  t=t.split('</think>').pop().replace(/<\|[^|]*\|>/g,'').trim();
+  return t;
+}
+const FACTS_PROMPT='Answer in JSON only, no other text. Keys: "top": what the person is wearing on their upper body, 2-4 words with colour, e.g. "grey hoodie". "hair": 2-5 words, e.g. "short light brown hair". "hood_up": true or false. "glasses": true or false. "headphones": true or false. "behind": an array of up to 4 specific objects that are clearly visible behind or around the person, 1-3 words each, e.g. ["wooden cabinet","white microwave"]. Only include things you can clearly see. Do not include clothing or body parts in "behind".';
+const cleanList=a=>(Array.isArray(a)?a:[]).map(x=>String(x).toLowerCase().trim().replace(/^(a|an|the) /,'')).filter(x=>x && x.length<30 && !PEOPLEWORDS.test(x));
+function parseJSON(t){
+  const m=String(t||'').match(/\{[\s\S]*\}/); if(!m) return null;
+  try{ return JSON.parse(m[0]); }catch(e){ return null; }
+}
+// drop a sentence cut off by the token limit
+function trimCut(t){
+  t=t.replace(/\s+/g,' ').trim();
+  const end=Math.max(t.lastIndexOf('.'),t.lastIndexOf('!'),t.lastIndexOf('?'));
+  return end>40 && end<t.length-1 ? t.slice(0,end+1) : t;
+}
+async function florence(task,canvas,max){
+  const img=AI.T.RawImage.fromCanvas(canvas);
+  const inputs=await AI.flProc(img,AI.flProc.construct_prompts(task));
+  const ids=await AI.fl.generate({...inputs,max_new_tokens:max});
+  const raw=AI.flProc.batch_decode(ids,{skip_special_tokens:false})[0];
+  return {raw, out:AI.flProc.post_process_generation(raw,task,img.size)[task]};
+}
+const PEOPLEWORDS=/\b(man|men|woman|women|boy|girl|person|people|guy|face|head|hair|eye|eyes|nose|mouth|ear|shirt|hand|arm|student|teen|child|kid|he|she|his|her)\b/i;
+async function analyse(snap){
+  if(!await loadAI()) { S.state='failed'; return; }
+  S.state='analysing';
+  try{
+    if(AI.clip){
+      aiStatus('analysing location');
+      const pl=await ask(snap.frame,PLACES,'a photo taken in {}','location'); S.place={name:pl.item[1],score:pl.score};
+      aiStatus('analysing background');
+      const bh=await ask(snap.bg,BEHIND,'a photo of {} in the background','behind'); S.behind={np:bh.item[1],pl:!!bh.item[2],score:bh.score};
+      S.wall=(await ask(snap.bg,WALLS,'a photo of a room with {} walls','walls')).item;
+      if(snap.torso){
+        aiStatus('analysing clothing');
+        S.cloth=(await ask(snap.torso,CLOTHES,'a photo of a person wearing {}','clothing')).item[1];
+        S.clothColour=(await ask(snap.torso,COLOURS,'a photo of a person wearing {} clothes','clothing col')).item;
+      }
+      if(snap.head){
+        aiStatus('analysing appearance');
+        S.glasses=await yes(snap.head,'a person wearing glasses','a person without glasses','glasses');
+        S.headphones=await yes(snap.head,'a person wearing headphones or earbuds','a person with no headphones','headphones');
+        const hood=await ask(snap.head,[['a person with their hood up','hood'],['a person wearing a cap or hat','cap'],['a person with nothing on their head','none']],'a photo of {}','headwear');
+        S.hat = hood.score>.55 && hood.item[1]!=='none' ? hood.item[1] : null;
+        S.hairLen=(await ask(snap.head,HAIRLEN,'a photo of a person with {}','hair length')).item[1];
+        S.hairColour=(await ask(snap.head,HAIRCOL,'a photo of a person with {}','hair colour')).item[1];
+      }
+      if(snap.faceC){
+        aiStatus('analysing face');
+        S.facialHair=(await ask(snap.faceC,FACIALHAIR,'a close-up photo of a face with {}','facial hair')).item[1];
+        S.eyes=(await ask(snap.faceC,EYECOL,'a close-up photo of a person with {}','eye colour')).item[1];
+        S.faceShape=(await ask(snap.faceC,FACESHAPE,'a photo of a person with {}','face shape')).item[1];
+        S.brows=(await ask(snap.faceC,BROWS,'a close-up photo of a person with {}','eyebrows')).item[1];
+        S.freckles=await yes(snap.faceC,'a face with freckles','a face without freckles','freckles');
+        S.piercing=await yes(snap.head,'a person with a visible ear or nose piercing','a person with no piercings','piercings');
+      }
+    }
+    if(AI.qw){
+      try{
+        aiStatus(`describing scene (${AI.qwName})`);
+        S.caption=S.rawCaption=trimCut(await qwen(snap.frame,'Describe this image in detail in one paragraph: the room, the objects in it and what is in the background. Plain prose, no lists, no headings.',{max:150}));
+        if(snap.head){
+          aiStatus(`describing face (${AI.qwName})`);
+          S.faceCaption=S.rawFace=trimCut(await qwen(snap.head,'Describe this person in one paragraph: their face, expression, hair and what they are wearing. Plain prose, no lists.',{max:120}));
+        }
+        // 1) structured facts. these replace CLIP's guesses, which are often wrong (it has to pick from a fixed list)
+        aiStatus(`checking details (${AI.qwName})`);
+        const fj=await qwen(snap.frame,FACTS_PROMPT,{max:130});
+        const q=parseJSON(fj);
+        if(q){
+          S.q=q;
+          if(q.top){ S.cloth=String(q.top).toLowerCase(); S.clothColour=null; }
+          if(q.hair) S.hairText=String(q.hair).toLowerCase();
+          S.glasses=q.glasses===true; S.headphones=q.headphones===true;
+          const behind=cleanList(q.behind);
+          if(behind.length){ S.behindList=behind; S.behind={np:'the '+behind[0], pl:/[^s]s$/.test(behind[0]), score:1}; }
+          if(q.hood_up===true) S.hat='hood'; else if(S.hat==='hood') S.hat=null;
+          // CLIP's face guesses (eye colour, freckles etc.) are unreliable on a webcam; drop them once qwen has looked
+          S.eyes=null; S.freckles=false; S.piercing=false; S.faceShape=null; S.brows=null; S.facialHair=null;
+        }
+        // 2) lines, only about things qwen just confirmed it can see
+        const facts=[S.cloth, ...(S.behindList||[]), S.hairText].filter(Boolean);
+        if(facts.length>=2){
+          aiStatus(`writing (${AI.qwName})`);
+          const raw=await qwen(snap.frame,`You write lines for a horror game. Something is watching the person in this photo through their webcam. These things are definitely in the photo: ${facts.join('; ')}. Write 3 short sentences it says to them. Each sentence must mention exactly one item from that list, using the same words, and must not mention anything that is not on the list. Lowercase, under 14 words each, calm and creepy, spoken to "you".\nExamples of the style (different items):\nthe lamp behind you flickers when i lean on it.\ni like the blue jumper. i'll keep it when you're gone.\nOne sentence per line. Write nothing else.`,{max:90,sample:true,temp:.6});
+          const keys=facts.flatMap(f=>f.split(/\s+/)).filter(w=>w.length>3);
+          S.lines=raw.split(/\n+/)
+            .map(l=>l.replace(/^[\s\d.\-*"'“”]+|["'“”\s]+$/g,'').toLowerCase())
+            .filter(l=>l.length>8 && l.split(' ').length<=18 && !/^(sure|here|okay|i can)/.test(l) && !/lamp behind you flickers|blue jumper/.test(l))
+            .filter(l=>keys.some(k=>l.includes(k)))   // must actually mention something real
+            .slice(0,3);
+        }
+      }catch(e){ console.warn('qwen run',e); }
+    }
+    if(AI.fl && !S.caption){
+      aiStatus(`describing scene (${AI.flDevice})`);
+      let r=await florence('<MORE_DETAILED_CAPTION>',snap.frame,120);
+      S.rawCaption=r.raw; S.caption=fixArticle(String(r.out||'').trim());
+      if(snap.head){
+        aiStatus(`describing face (${AI.flDevice})`);
+        r=await florence('<MORE_DETAILED_CAPTION>',snap.head,100);
+        S.rawFace=r.raw; S.faceCaption=fixArticle(String(r.out||'').trim());
+      }
+    }
+    if(AI.fl){
+      aiStatus(`mapping regions (${AI.flDevice})`);
+      let r=await florence('<DENSE_REGION_CAPTION>',snap.frame,256);
+      const reg=r.out, vw=snap.frame.width, vh=snap.frame.height, seen=new Set();
+      S.regions=(reg?.bboxes||[]).map((bb,i)=>({box:[bb[0],bb[1],bb[2]-bb[0],bb[3]-bb[1]],label:String(reg.labels[i]||'').trim()}))
+        .filter(o=>o.label && o.box[2]*o.box[3] < vw*vh*.85).slice(0,12);
+      S.rawRegions=S.regions.map(o=>`${o.label}<loc_${o.box.map(Math.round).join('><loc_')}>`).join('');
+      for(const o of S.regions){ const l=o.label.toLowerCase(); if(!PEOPLEWORDS.test(l) && !seen.has(l) && l.length<40){ seen.add(l); S.items.push(fixArticle(/^(a|an|the)\b/i.test(l)?l:'a '+l)); } }
+    }
+    if(snap.rear){
+      if(AI.qw){
+        try{
+          aiStatus(`looking ahead (${AI.qwName})`);
+          const pj=parseJSON(await qwen(snap.rear,`Answer in JSON only, no other text. Keys: "place": where this photo was taken, exactly one of: ${Object.keys(PLACE_LINE).join(', ')}. "objects": an array of up to 5 specific objects clearly visible, 1-3 words each, no people or body parts.`,{max:100}));
+          if(pj){
+            const pn=String(pj.place||'').toLowerCase().trim();
+            if(PLACE_LINE[pn]) S.place={name:pn,score:1};
+            S.frontList=cleanList(pj.objects).slice(0,5);
+          }
+          S.frontCaption=trimCut(await qwen(snap.rear,'Describe this photo in one paragraph: what kind of room or place it is and what is in it. Plain prose, no lists.',{max:110}));
+        }catch(e){ console.warn('qwen rear',e); }
+      } else if(AI.clip){
+        const pl=await ask(snap.rear,PLACES,'a photo taken in {}','rear place');
+        if(!S.place || pl.score>S.place.score) S.place={name:pl.item[1],score:pl.score};
+      }
+      if(AI.fl && !S.frontCaption){ try{ const r=await florence('<MORE_DETAILED_CAPTION>',snap.rear,100); S.frontCaption=fixArticle(String(r.out||'').trim()); }catch(e){} }
+    }
+    S.state='ready'; aiStatus('analysis complete');
+    if(running && watching && !S.announced){ S.announced=true; interject(`scene analysis complete. ${S.log.length} questions answered about you. it knows where you are now.`); }
+    setTimeout(()=>{ if(S.state==='ready') aiStatus(''); },6000);
+  }catch(e){ console.warn('analyse',e); S.state=S.place?'ready':'failed'; aiStatus(S.place?'partial analysis':'analysis failed'); }
+}
+// prints everything the models produced, straight into the terminal
+async function dumpModels(title){
+  await type(`--- ${title} ---`,{cls:'white',speed:6,pause:150});
+  const L=(t,c='dim')=>type(t,{cls:c,speed:3,pause:40});
+  if(V.face){
+    const f=V.face, a=f.rotation?.angle||{}, deg=v=>Math.round((v||0)*57.3)+'°';
+    await L(`[human] face ${pct(f.score)}  box ${f.box.map(Math.round).join(',')}  landmarks ${f.mesh?.length||0}  iris ${f.annotations?.leftEyeIris?'locked':'n/a'}`);
+    await L(`[human] rotation      yaw ${deg(a.yaw)}  pitch ${deg(a.pitch)}  roll ${deg(a.roll)}  gaze ${Math.abs(V.yaw)>.55?'away':'screen'}`);
+    await L(`[human] emotion       ${(f.emotion||[]).map(e=>`${e.emotion} ${pct(e.score)}`).join(' | ')||'n/a'}`);
+    await L(`[human] eyes          openness ${V.open.toFixed(2)} (baseline ${V.openBase.toFixed(2)})  blinks ${V.blinks}  peak fear ${pct(V.peakFear)}`);
+    if(V.faces.length>1) await L(`[human] subjects      ${V.faces.length} faces in frame`,'red');
+  }
+  for(const l of S.log) await L(l);
+  if(S.rawCaption){ await L('[florence] <MORE_DETAILED_CAPTION> :: frame'); await L('  '+S.rawCaption,'red'); }
+  if(S.rawFace){ await L('[florence] <MORE_DETAILED_CAPTION> :: subject face'); await L('  '+S.rawFace,'red'); }
+  if(S.regions.length){
+    await L('[florence] <DENSE_REGION_CAPTION>');
+    for(const o of S.regions) await L(`  [${o.box.map(v=>String(Math.round(v)).padStart(4)).join(',')}] ${o.label}`);
+  }
+  if(!S.log.length && !S.rawCaption) await L(`[scene] ${S.state==='failed'?'scene models unavailable':'analysis still running'}`);
+}
+// personal details are handed out one at a time across the shift, never repeated
+const usedFacts=new Set();
+function personFact(mode){
+  const opts=[
+    ['cloth', clothText(), mode==='it'?fixArticle(`it's wearing a ${clothText()}. just like yours.`):`that ${clothText()}. easy to pick out in the dark.`],
+    ['hair', hairText(), mode==='it'?`${hairText()}. just like yours.`:`${hairText()}. it'll remember that.`],
+    ['glasses', S.glasses, mode==='it'?'it\'s wearing glasses. it doesn\'t need them.':'nice glasses. they won\'t help you see it.'],
+  ];
+  for(const [k,ok,line] of opts){ if(ok && !usedFacts.has(k)){ usedFacts.add(k); return line; } }
+  return null;
+}
+// objects from your room, with articles. frontList[0] and behindList[0] are saved for later beats
+function objPool(){
+  const raw=[...(S.frontList||[]).slice(1), ...(S.behindList||[]).slice(1), ...S.items.map(x=>x.replace(/^(a|an|the) /i,''))];
+  return [...new Set(raw)].filter(x=>!usedFacts.has('obj:'+x));
+}
+function takeObjects(n){ const o=objPool().slice(0,n); o.forEach(x=>usedFacts.add('obj:'+x)); return o.map(x=>fixArticle('a '+x)); }
+
+// one still from the rear camera (phones, and tablets like the Surface), to see what's in front of the player
+async function rearSnap(){
+  let stopped=false;
+  try{
+    const devs=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput');
+    console.log('cameras:',devs.map(d=>d.label||'(no label)'));
+    if(devs.length<2) return null;
+    const curId=stream?.getVideoTracks()[0]?.getSettings().deviceId;
+    // a named rear camera wins; skip IR / virtual cameras and the one we're already using
+    const byName=devs.find(d=>/rear|back|environment|world/i.test(d.label) && !/\bir\b|infrared|virtual|effects|obs/i.test(d.label) && d.deviceId!==curId);
+    const labelled=devs.some(d=>d.label);
+    if(labelled && !byName && !devs.some(d=>/front|user|face/i.test(d.label))) return null;   // e.g. two webcams on a desktop
+    // most devices can't run both cameras at once
+    if(stream) stream.getTracks().forEach(t=>t.stop()); stopped=true;
+    const tries=[];
+    if(byName) tries.push({deviceId:{exact:byName.deviceId}});
+    tries.push({facingMode:{exact:'environment'}});
+    let rs=null;
+    for(const t of tries){
+      try{ rs=await navigator.mediaDevices.getUserMedia({video:{...t,width:{ideal:1280},height:{ideal:960}},audio:false}); break; }
+      catch(e){ console.warn('rear camera try failed',t,e.name); }
+    }
+    if(!rs) return null;
+    const rv=document.createElement('video'); rv.muted=true; rv.playsInline=true; rv.srcObject=rs; await rv.play();
+    for(let i=0;i<60 && !rv.videoWidth;i++) await sleep(50);
+    await sleep(900); // let exposure settle
+    let c=null;
+    if(rv.videoWidth){ c=document.createElement('canvas'); c.width=rv.videoWidth; c.height=rv.videoHeight; c.getContext('2d').drawImage(rv,0,0); }
+    rs.getTracks().forEach(t=>t.stop());
+    return c;
+  }catch(e){ console.warn('rear camera',e); return null; }
+  finally{ if(stopped) camOn=await initCam(); }
+}
+
+// second look, later in the game, compared with the calibration frame
+let changeTask=null;
+const sameThing=(a,b)=>{ const w=x=>String(x||'').toLowerCase().split(/\s+/).filter(t=>t.length>3); const B=w(b); return w(a).some(t=>B.includes(t)); };
+function startChangeCheck(){
+  if(!camOn || !S.base || video.readyState<2) return;
+  const s2=snapshot();
+  changeTask=(async()=>{
+    let q2=null;
+    if(AI.qw && S.q && (S.state==='ready'||S.state==='failed')){ try{ q2=parseJSON(await qwen(s2.frame,FACTS_PROMPT,{max:130})); }catch(e){ console.warn('qwen recheck',e); } }
+    return changeLines(S.base,s2.metrics,S.q,q2);
+  })();
+}
+function changeLines(a,b,qa,qb){
+  const out=[];
+  if(b.faces>a.faces) out.push('someone else is in the room now. they weren\'t there when you sat down.');
+  else if(a.faces>1 && b.faces<a.faces) out.push('the person who was next to you is gone. it\'s just you and it now.');
+  const db=b.bright-a.bright;
+  if(db<-25) out.push('it\'s darker in your room than when you started. did you do that?');
+  else if(db>25) out.push('a light came on since you sat down. it noticed.');
+  if(qa && qb){
+    if(!qa.hood_up && qb.hood_up===true) out.push('you put your hood up. it doesn\'t hide you.');
+    else if(qa.hood_up===true && qb.hood_up===false) out.push('you took your hood down. thank you.');
+    if(qa.headphones===true && qb.headphones===false) out.push('you took your headphones off. good. now you can hear it.');
+    else if(!qa.headphones && qb.headphones===true) out.push('you put headphones on. that won\'t keep it out.');
+    if(qa.glasses===true && qb.glasses===false) out.push('you took your glasses off. it\'s blurry now, isn\'t it.');
+    if(qa.top && qb.top && !sameThing(qa.top,qb.top)) out.push(`you're not wearing the ${String(qa.top).toLowerCase()} anymore.`);
+  }
+  if(a.fw && b.fw){
+    const r=b.fw/a.fw;
+    if(r>1.18) out.push('you\'ve leaned closer to the screen since you sat down. it\'s leaning closer too.');
+    else if(r<.85) out.push('you\'ve leaned back from the screen. not far enough.');
+    else if(a.cx!=null && Math.abs(b.cx-a.cx)>.2) out.push('you\'ve shifted in your seat since you sat down. it moved with you.');
+  }
+  if(!out.length && a.fw && b.fw) out.push('you haven\'t really moved since you sat down. neither has it.');
+  return out.slice(0,2);
+}
+
+// one button on the title screen that pulls every model into the cache
+async function preload(){
+  out.innerHTML='';
+  addLine('DOWNLOADING MODELS','hdr'); gap();
+  addLine('this only happens once. after this the game starts fast.','dim');
+  addLine('it can take a few minutes. leave this tab open.','dim'); gap();
+  await loadVision((t,c='dim')=>addLine('  '+t,c));
+  const l=addLine('  scene models ......... starting','dim');
+  const iv=setInterval(()=>{ const t=aiEl.textContent.replace('SCENE AI · ',''); if(t) l.textContent='  scene models ......... '+t; },250);
+  const ok=await loadAI();
+  clearInterval(iv);
+  l.textContent='  scene models ......... '+(ok?'cached'+(AI.qw?` (${AI.qwName})`:' (no WebGPU, using the smaller models)'):'failed. the game still works without them.');
+  gap(); addLine(ok?'done. you\'re ready.':'something didn\'t download. check your connection and try again, or just play.', ok?'white':'red');
+  await choose(['Back to the title screen']);
+  intro();
+}
+
+async function waitScene(ms,onTick){ const t=performance.now(); while(S.state!=='ready'&&S.state!=='failed'&&performance.now()-t<ms){ onTick&&onTick(); await sleep(250); } return S.state==='ready'; }
+async function waitFor(cond,ms){ const t=performance.now(); while(performance.now()-t<ms){ if(cond()) return true; await sleep(50); } return false; }
+
+// tab switching
+let awayAt=0;
+document.addEventListener('visibilitychange',()=>{
+  if(!running) return;
+  if(document.hidden) awayAt=Date.now();
+  else if(awayAt){ const s=Math.max(1,Math.round((Date.now()-awayAt)/1000)); awayAt=0; glitch(); addLine(`[${s}s] you looked away. it didn't.`,'red'); }
+});
+let inputMoves=0;
+['pointermove','pointerdown','keydown','wheel','touchstart','touchmove'].forEach(ev=>window.addEventListener(ev,()=>inputMoves++,{passive:true}));
+
+// =====================================================================
+// story
+// =====================================================================
+const ROOMS=['01 LOBBY','02 RECORDS HALL','03 STAIRWELL B','04 BASEMENT','05 LOADING BAY','06 MONITOR ROOM'];
+const DESC={
+  '01 LOBBY':'front desk. revolving door chained shut. the clock on the wall stopped at 3.',
+  '02 RECORDS HALL':'rows of filing shelves running back into the dark. one drawer is open.',
+  '03 STAIRWELL B':'concrete stairs going down. the light at the bottom flickers in a rhythm, like breathing.',
+  '04 BASEMENT':'boiler, pipes, a mattress against the wall that is not on the inventory.',
+  '05 LOADING BAY':'roller door half up. outside is completely black, not night-black. nothing-black.',
+  '06 MONITOR ROOM':'a desk. a chair. a terminal. this is the room the cameras feed into.'
+};
+
+async function intro(){
+  out.innerHTML='';
+  addLine('NIGHTWATCH','big'); gap();
+  addLine('a short text horror game. about eight minutes.');
+  addLine('headphones on. lights off if you think you\'re tough.'); gap();
+  addLine('this game watches you through your webcam the whole time.','dim');
+  addLine('it tracks your face, eyes and expression live, and works out where you are, what you\'re','dim');
+  addLine('wearing and what\'s behind you. the story reacts to all of it.','dim');
+  addLine('on a phone it also takes one picture with the back camera, to see what\'s in front of you.','dim');
+  addLine('all of it runs on this computer. nothing is recorded, saved or uploaded.','dim');
+  addLine('first run downloads the AI models (about 400MB, or around 2GB with a decent GPU) and caches them. you need internet.','dim');
+  addLine('works best in Chrome or Edge, face lit from the front.','dim'); gap();
+  addLine('tip: click the text to skip typing. number keys choose.','dim');
+  const opts=['Play with camera','Play without camera']; if(!AI.loading) opts.push('Download the AI models first');
+  const c=await choose(opts);
+  if(c===2) return preload();
+  initAudio();
+  await game(c===0);
+}
+
+async function game(wantCam){
+  running=true; out.innerHTML='';
+  const vis = wantCam ? await boot() : false;
+  tension(.25,4);
+
+  await type('NIGHTWATCH REMOTE SECURITY TERMINAL v3.0',{cls:'hdr'});
+  await type('site: HOLLOW CREEK RECORDS FACILITY (decommissioned)');
+  await type('shift: 00:00 - 06:00');
+  await type('previous operator: D. MARLOW  -  status: [no record]',{cls:'dim'}); gap();
+  await type('--- message from supervisor ---',{cls:'dim'});
+  await type('check the cameras once an hour. if you see someone, don\'t engage. just log it.');
+  await type('there are six cameras.');
+  await type('if you ever see a seventh, close the terminal and do not open it again.',{pause:900}); gap();
+  watching=vis;
+
+  // ---- 01:00
+  await type('[01:00] hourly check. select a camera.',{cls:'white'});
+  const r1=ROOMS[await choose(ROOMS.slice(0,5))];
+  await type(`CAM ${r1}: ${DESC[r1]}`);
+  await type('someone is standing in the corner. facing the wall. not moving.',{pause:700});
+  if(vis){ const f=personFact('it'); if(f) await type(f,{cls:'red'}); }
+  if(await choose(['Log it','Zoom in'])===1){
+    await type('the image won\'t sharpen. the closer you zoom, the less it looks like a person.');
+    await type('you zoom back out. it\'s still facing the wall. you think.');
+  }
+  await type(`LOG 01:04 - unidentified person, ${r1}.`,{cls:'dim'}); gap();
+  tension(.4);
+
+  // ---- 02:00
+  await type('[02:00] hourly check. select a camera.',{cls:'white'});
+  let r2=ROOMS[await choose(ROOMS.slice(0,5))];
+  if(r2===r1){
+    await type(`CAM ${r2}: the corner is empty.`);
+    r2=pickOne(ROOMS.slice(0,5).filter(r=>r!==r1));
+    await type(`the feed switches by itself. CAM ${r2}.`,{cls:'red'});
+  } else await type(`CAM ${r2}: ${DESC[r2]}`);
+  await type('it\'s here now. turned around this time. facing the camera.');
+  if(vis){ const f=personFact('it'); if(f) await type(f,{cls:'red'}); }
+  await type('it didn\'t walk past any other camera to get here.',{pause:800});
+  if(vis){ const o=takeObjects(1)[0]; if(o) await type(`there's ${o} in the corner of the room now. it isn't on the inventory.`); }
+  if(await choose(['Check the previous camera','Call your supervisor'])===0){
+    await type(`CAM ${r1}: empty. wet footprints on the floor, leading toward the camera.`);
+    await type(S.place?`toward you. toward your ${S.place.name}.`:'toward you.',{cls:'red'});
+  } else {
+    await type('the line rings once. someone picks up. no one speaks.');
+    await type('you can hear breathing. and behind it, very faint, the sound of someone typing.');
+    await type('it\'s your keyboard.',{cls:'red'});
+  }
+  gap(); tension(.55);
+
+  // ---- 03:00
+  await type('[03:00] hourly check.',{cls:'white'});
+  await choose(['Check all cameras']);
+  for(const r of ROOMS.slice(0,5)) await type(`CAM ${r}: NO SIGNAL`,{speed:10,pause:200,cls:'dim'});
+  if(vis && S.state!=='ready' && S.state!=='failed'){
+    const l=addLine('CAM 06 MONITOR ROOM: buffering...','dim');
+    await waitScene(25000,()=>{ l.textContent='CAM 06 MONITOR ROOM: buffering... '+(aiEl.textContent.replace('SCENE AI · ','')||''); });
+    l.remove();
+  }
+  let items=vis?takeObjects(4):[];
+  if(items.length<2 && S.behind){ items=[S.behind.np.replace(/^the /,S.behind.pl?'':'a '), S.wall?`${S.wall} walls`:null].filter(Boolean); }
+  if(items.length>=2 || (items.length && S.place)){
+    await type(`CAM 06 MONITOR ROOM: ${listify(items)}.`);
+    await type('that isn\'t what the monitor room looks like.');
+    await type(`that's what YOUR ${S.place?S.place.name:'room'} looks like.`,{cls:'red',pause:900});
+  } else await type(`CAM 06 MONITOR ROOM: ${DESC['06 MONITOR ROOM']}`);
+  if(vis && V.face) await type(V.faces.length>1?`${V.faces.length} people at the desk. you only hired one operator.`:'one person sitting at the desk.');
+  await type('the chair is pushed back, like someone just stood up from it.');
+  await type('the terminal on that desk is showing this exact screen.',{pause:1200});
+  glitch(); gap();
+  await type('NEW DEVICE DETECTED: CAM 07 [UNLISTED]',{cls:'red',speed:45,pause:900});
+  if(await choose(['Open CAM 07','Close the terminal, like you were told'])===1){
+    await type('closing terminal...',{cls:'dim'}); await sleep(900);
+    await type('you can\'t close something that\'s already open.',{cls:'red'});
+    await type('opening CAM 07.',{cls:'dim'});
+  }
+  tension(.75);
+
+  // ---- CAM 07
+  await type('connecting...',{cls:'dim'});
+  const feed=makeFeed('CAM 07  [UNLISTED]'); await sleep(2000);
+  if(camOn){
+    const s=sample();
+    if(s.bright>=0&&s.bright<55) await type('it\'s dark where you are. it likes that.');
+    else if(s.bright>140) await type('you\'ve got the lights on. that\'s cute. it doesn\'t matter.');
+    else await type('nice room.');
+    const hr=new Date().getHours();
+    await type(`the timestamp says ${nowHM()}. that isn't footage from the building.`);
+    await type(hr>=6&&hr<19?'it\'s daytime where you are. you think that helps.':'it\'s late where you are. good.');
+    await type('that\'s now. that\'s you.',{cls:'red',pause:1200});
+    if(vis){
+      if(S.state!=='ready' && S.state!=='failed'){
+        const l=addLine('decrypting feed...','dim');
+        await waitScene(90000,()=>{ l.textContent='decrypting feed... '+(aiEl.textContent.replace('SCENE AI · ','')||''); });
+        l.remove();
+      }
+      if(S.place && S.place.score>.25 && PLACE_LINE[S.place.name]) await type(PLACE_LINE[S.place.name]);
+      const pf=personFact('you'); if(pf) await type(pf);
+      if(S.hat==='hood') await type('the hood won\'t hide you.');
+      else if(S.hat==='cap') await type('the cap won\'t hide your face. it already knows your face.');
+      if(S.headphones) await type('take your headphones off. you\'ll want to hear it coming.',{cls:'red'});
+      if(S.behind && S.behind.score>.12){
+        const np=S.behind.np, special=BEHIND_LINE[np];
+        await type(special || `${np} behind you. don't look. it's been standing right next to ${S.behind.pl?'them':'it'}.`);
+      }
+      for(const l of S.lines.slice(0,2)) await type(l,{cls:'red',speed:30,pause:700});
+      hud=true; await sleep(400);
+      await type('it\'s been studying you.',{cls:'red',pause:800});
+      if(V.face){
+        const top=Object.entries(V.emo).sort((a,b)=>b[1]-a[1])[0];
+        if(top){
+          const [e,v]=top;
+          if(e==='neutral') await type(`you're trying to look calm. ${pct(v)} neutral. it can see the other ${Math.max(1,100-Math.round(v*100))}%.`);
+          else if(e==='happy') await type(`${pct(v)} happy. you won't be.`);
+          else await type(`${pct(v)} ${e}. good. that's the right answer.`);
+        }
+        await type(`it has counted ${V.blinks} blink${V.blinks===1?'':'s'} since you sat down.`);
+      } else await type('it can\'t see your face properly. it doesn\'t need to.');
+      const notes=[clothText(), hairText(), S.glasses&&'glasses', S.behindList?.[0]&&`${S.behindList[0]} behind`, S.frontList?.[0]&&`${S.frontList[0]} in front`].filter(Boolean);
+      if(notes.length>=2){
+        await type('it wrote you down, so it can find you again:',{pause:400});
+        await type(`"${notes.join('. ')}."`,{cls:'red',speed:22,pause:1000});
+      }
+    }
+  } else {
+    await type('no picture. just static.');
+    await type('but there\'s a rhythm in the static. it matches your breathing.',{pause:1200});
+  }
+  placeFigure(); fig.p=.05; fig.on=true; wantSeg=true; await sleep(2000);
+  await type('there\'s something in the background. no, don\'t check. keep looking at the screen.',{pause:900});
+  hud=false; segEvery=300;
+
+  // ---- don't move
+  watching=false;
+  if(vis) startChangeCheck();
+  await type('don\'t move.',{cls:'red',speed:60,pause:300});
+  heartbeat(true,750);
+  let strikes=0; inputMoves=0; sample();
+  const t0=Date.now();
+  while(Date.now()-t0<8000 && strikes<3){
+    await sleep(200);
+    const pix=camOn?sample().motion:0;
+    const moved = camOn ? ((vis&&V.face) ? V.moveEMA>.06 || pix>9 : pix>7) : inputMoves>4;
+    inputMoves=0;
+    if(moved){ strikes++; glitch(); thump(); fig.p=Math.min(.55,fig.p+.15);
+      await typeRaw(strikes===1?'I SAID DON\'T MOVE.':strikes===2?'it saw that.':'closer.',{cls:'red',speed:15,pause:500});
+      V.moveEMA=0; sample(); }
+  }
+  heartbeat(false);
+  if(strikes===0) await type('good. you\'re very good at staying still. so is it.');
+  fig.p=Math.max(fig.p,.3);
+  await type('it\'s closer now.',{pause:900});
+
+  // ---- don't blink
+  const canSeeEyes = vis && V.openBase>0 && faceFresh(2000);
+  if(canSeeEyes){
+    await type('it only moves when your eyes are closed.');
+    await type('don\'t blink.',{cls:'red',speed:70,pause:200});
+    heartbeat(true,650);
+    const b0=V.blinks, t1=Date.now(); let seen=0;
+    while(Date.now()-t1<10000){
+      await sleep(60);
+      if(V.blinks>b0+seen){ seen=V.blinks-b0; fig.p=Math.min(.8,fig.p+.08); glitch(); thump(); addLine(seen===1?'blink.':`blink. (${seen})`,'red'); }
+    }
+    heartbeat(false);
+    await type(seen===0?'ten seconds without blinking. your eyes must be burning. it waited.':`you blinked ${seen} time${seen===1?'':'s'}. it took ${seen} step${seen===1?'':'s'}.`);
+  } else {
+    await sleep(1500);
+  }
+  if(vis && changeTask){
+    const cl=await Promise.race([changeTask, sleep(15000).then(()=>null)]).catch(()=>null);
+    if(cl && cl.length){
+      await type('it compared you to how you were when you sat down.',{pause:400});
+      for(const l of cl) await type(l,{cls:'red',pause:700});
+    }
+  }
+  fig.p=Math.max(fig.p,.75); tension(.95);
+  await type('it\'s right behind you.',{cls:'red',speed:55,pause:400});
+
+  // ---- turn around (physically, if we can see you)
+  const turn=await choose(['Turn around','Don\'t']);
+  if(turn===0){
+    if(vis && V.face){
+      await type('go on then. turn around. properly.',{pause:200});
+      const turned=await waitFor(()=>performance.now()-V.lastFaceAt>500 || Math.abs(V.yaw)>.75,7000);
+      if(turned){
+        fig.hidden=true;
+        await waitFor(()=>performance.now()-V.lastFaceAt<200 && Math.abs(V.yaw)<.4,8000);
+        await type('nothing there. obviously.');
+        await type('you turn back to the screen.',{pause:700});
+        fig.p=.95; fig.hidden=false;
+        if(S.frontList?.[0]){
+          await type('it was never behind you.',{cls:'red'});
+          await type(`it's in front of you. next to the ${S.frontList[0]}.`,{cls:'red',pause:900});
+        } else {
+          await type('it\'s still on the screen. it was never behind you in your room.',{cls:'red'});
+          await type('it was behind you in here.',{cls:'red',pause:900});
+        }
+      } else {
+        await type('you didn\'t actually turn around. you just clicked the button.');
+        await type('smart. or scared. it can\'t tell which. neither can you.',{pause:900});
+      }
+    } else {
+      fig.hidden=true;
+      await type('you turn around. nothing.');
+      await type('you turn back to the screen.',{pause:900});
+      fig.hidden=false; fig.p=.95;
+    }
+  } else {
+    await type('smart. it would rather you didn\'t see it coming.',{pause:600});
+    if(S.frontList?.[0]) await type(`besides, it isn't behind you. it's in front of you. next to the ${S.frontList[0]}.`,{cls:'red',pause:900});
+  }
+
+  // ---- finale: close your eyes
+  tension(0,.3); segEvery=200;
+  let react;
+  if(vis && V.openBase>0 && faceFresh(2500)){
+    await type('one last thing.');
+    await type('close your eyes and count to five. we\'ll tell you when you can open them.',{pause:200});
+    heartbeat(true,600); wantSeg=false;
+    const shut=await waitFor(()=>V.closed && performance.now()-V.closedAt>250,7000);
+    if(shut){
+      fig.p=1;
+      await waitFor(()=>!V.closed || performance.now()-V.lastFaceAt>600,12000);
+      heartbeat(false);
+      react=await jumpscare();
+    } else {
+      heartbeat(false);
+      await type('you didn\'t close them. that\'s fine.',{pause:200});
+      await type('it doesn\'t need you to.',{cls:'red',pause:200});
+      fig.p=1; await sleep(1800+Math.random()*1200);
+      react=await jumpscare();
+    }
+  } else {
+    heartbeat(true,500);
+    await type('. . .',{speed:400,pause:300});
+    heartbeat(false); fig.p=1; await sleep(2300+Math.random()*1500);
+    react=await jumpscare();
+  }
+
+  // ---- end
+  watching=false; fig.on=false; wantSeg=false;
+  feeds.forEach(f=>f.live&&closeFeed(f)); running=false;
+  visionOn=false; killCam();
+  out.innerHTML=''; await sleep(1500);
+  await type('SHIFT ENDED  06:00',{cls:'hdr'});
+  await type('OPERATOR STATUS: [no record]',{cls:'red',pause:900});
+  if(vis){
+    gap();
+    await type('OPERATOR ANALYSIS',{cls:'white',pause:200});
+    const r=(k,v)=>`  ${k.padEnd(24,'.')} ${v}`;
+    const topR=Object.entries(react?.emo||{}).sort((a,b)=>b[1]-a[1])[0];
+    const lines=[
+      r('peak fear',V.peakFear>0?`${pct(V.peakFear)} (${V.peakFearEmo})`:'none recorded'),
+      r('expression at contact',topR?`${topR[0]} ${pct(topR[1])}`:'face not visible'),
+      r('flinch',react?.flinch>.08?`${pct(Math.min(react.flinch,3))} of your face width`:'none detected. impressive. or you weren\'t looking.'),
+      r('blinks counted',String(V.blinks)),
+      r('times you looked away',String(V.awayCount)),
+      r('time out of frame',`${Math.round(V.outMs/1000)}s`),
+      r('other people detected',String(V.extraSeen)),
+    ];
+    if(S.place) lines.push(r('location',S.place.name));
+    if(S.cloth) lines.push(r('wearing',`${S.clothColour?S.clothColour+' ':''}${S.cloth}`));
+    if(S.behind) lines.push(r('behind you',S.behind.np.replace(/^the /,'').replace(/ behind you$/,'')));
+    if(S.frontList?.length) lines.push(r('in front of you',listify(S.frontList.slice(0,4))));
+    if(S.wall) lines.push(r('walls',S.wall));
+    const look=[S.faceShape&&`${S.faceShape} face`, S.eyes&&`${S.eyes} eyes`, S.brows&&`${S.brows} brows`, S.facialHair, hairText(), S.glasses&&'glasses', S.freckles&&'freckles', S.piercing&&'piercing'].filter(Boolean);
+    if(look.length) lines.push(r('subject',look.join(', ')));
+    if(S.items.length) lines.push(r('items logged',listify(S.items.slice(0,5))));
+    for(const l of lines) await type(l,{cls:'dim',speed:8,pause:120});
+  }
+  if(vis && S.faceCaption){ gap(); await type('SUBJECT DESCRIPTION',{cls:'white',pause:150}); await type('  '+S.faceCaption,{cls:'dim',speed:6,pause:300}); }
+  if(vis && S.caption){ gap(); await type('SCENE DESCRIPTION',{cls:'white',pause:150}); await type('  '+S.caption,{cls:'dim',speed:6,pause:300}); }
+  if(vis && S.frontCaption){ gap(); await type('IN FRONT OF YOU',{cls:'white',pause:150}); await type('  '+S.frontCaption,{cls:'dim',speed:6,pause:300}); }
+  gap();
+  await type('(camera\'s off. nothing was recorded. sleep well, or don\'t.)',{cls:'dim',speed:15});
+  await choose(['Play again']);
+  location.reload();
+}
+
+// camera + model boot and the calibration scene
+async function boot(){
+  await type('requesting optical access...',{cls:'dim'});
+  camOn=await initCam();
+  if(!camOn){ await type('optical access denied. continuing blind.',{cls:'dim'}); return false; }
+  await type('optical access granted.',{cls:'dim'});
+  await type('loading neural networks (first run downloads ~10MB)...',{cls:'dim',pause:100});
+  const ok=await loadVision((t,c='dim')=>addLine('  '+t,c));
+  if(!ok){ await type('vision offline. basic motion tracking only.',{cls:'dim'}); return false; }
+  loadAI();
+  addLine('  scene models (CLIP, Florence-2, Qwen3.5) .. downloading in background','dim');
+  await type('compiling shaders...',{cls:'dim',pause:50});
+  try{ await human.detect(video); }catch(e){}
+  visionOn=true; visionLoop();
+  gap();
+  await type('OPTICAL CALIBRATION',{cls:'hdr',pause:150});
+  const cal=makeFeed('CALIBRATION'); hud=true;
+  await type('look at the screen. hold still.',{pause:200});
+  wantSeg=true;
+  const got=await waitFor(()=>V.faceSeenMs>1500,12000);
+  await waitFor(()=>V.mask,3000); await sleep(400);
+  if(got){
+    await type(`subject acquired. 468 facial landmarks locked.${V.faces.length>1?` ${V.faces.length-1} additional subject${V.faces.length>2?'s':''} detected.`:''}`,{cls:'dim'});
+  } else await type('subject not found. sit in front of the camera, with light on your face.',{cls:'dim'});
+  if(got) await dumpModels('CALIBRATION :: RAW OUTPUT');
+  await type('capturing environment for analysis...',{cls:'dim',pause:100});
+  const snap=snapshot(); wantSeg=false; S.base=snap.metrics;
+  const rl=addLine('  rear sensor ............. checking','dim');
+  snap.rear=await rearSnap();
+  rl.textContent='  rear sensor ............. '+(snap.rear?'captured':'not found');
+  analyse(snap);
+  addLine('  > frame captured. analysis runs in the background. nothing leaves this computer.','dim');
+  addLine('  > first run downloads the scene models. progress is shown top right.','dim');
+  await sleep(1400);
+  hud=false; closeFeed(cal,'CALIBRATION COMPLETE');
+  await type('calibration complete. thank you, operator.',{cls:'dim'}); gap();
+  return true;
+}
+
+intro();
+</script>
+</body>
+</html>
