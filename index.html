@@ -397,40 +397,114 @@ const pickOne=a=>a[Math.random()*a.length|0];
 // rendering a live CCTV feed (with optional analysis HUD and the figure)
 // =====================================================================
 const feeds=[];
-const BUF={frames:[],on:false,timer:0,starer:null,starerAt:0};
-const FS={mode:'live',delay:0,ghostAgo:0};   // what CAM 07 is really showing
+// rolling buffer: ~10s of camera frames at 15fps, in memory only, overwritten as it goes
+const BUF={frames:[],on:false,timer:0,starer:null,starerBox:null,starerAt:0};
+const FS={mode:'live',delay:0,ghostAgo:0,since:0,held:null,unmirror:false};   // what CAM 07 is really showing
+const BUF_W=400, BUF_N=150, BUF_MS=66;
 function startBuffer(){
   if(BUF.on || !camOn) return; BUF.on=true;
   const loop=()=>{
     if(!BUF.on) return;
     if(camOn && video.readyState>=2 && video.videoWidth){
-      const now=performance.now();
-      const c=BUF.frames.length>=150 ? BUF.frames.shift().c : document.createElement('canvas');
-      c.width=320; c.height=Math.round(320*video.videoHeight/video.videoWidth);
+      const now=performance.now(), vw=video.videoWidth, vh=video.videoHeight;
+      let c;
+      if(BUF.frames.length>=BUF_N) c=BUF.frames.shift().c; else { c=document.createElement('canvas'); c.width=BUF_W; c.height=Math.round(BUF_W*vh/vw); }
       c.getContext('2d').drawImage(video,0,0,c.width,c.height);
       BUF.frames.push({c,t:now});
-      // keep one good frame of you looking straight down the lens
-      if(V.face && now-V.lastFaceAt<300 && Math.abs(V.yaw)<.2 && !V.closed && now-BUF.starerAt>1000){
+      // keep one good frame of you looking straight down the lens, and where your face was in it
+      if(V.face && now-V.lastFaceAt<300 && Math.abs(V.yaw)<.18 && !V.closed && now-BUF.starerAt>1000){
         BUF.starer ||= document.createElement('canvas');
-        BUF.starer.width=640; BUF.starer.height=Math.round(640*video.videoHeight/video.videoWidth);
-        BUF.starer.getContext('2d').drawImage(video,0,0,BUF.starer.width,BUF.starer.height); BUF.starerAt=now;
+        const k=720/vw; BUF.starer.width=720; BUF.starer.height=Math.round(vh*k);
+        BUF.starer.getContext('2d').drawImage(video,0,0,BUF.starer.width,BUF.starer.height);
+        BUF.starerBox=V.face.box.map(v=>v*k); BUF.starerAt=now;
       }
     }
-    BUF.timer=setTimeout(loop,166);
+    BUF.timer=setTimeout(loop,BUF_MS);
   };
   loop();
 }
-function stopBuffer(){ BUF.on=false; clearTimeout(BUF.timer); BUF.frames=[]; BUF.starer=null; FS.mode='live'; }
+function stopBuffer(){ BUF.on=false; clearTimeout(BUF.timer); BUF.frames=[]; BUF.starer=null; FS.mode='live'; FS.unmirror=false; FS.held=null; }
+const bufSpan=()=>BUF.frames.length>1 ? BUF.frames[BUF.frames.length-1].t-BUF.frames[0].t : 0;
 function frameAt(ago){
   const t=performance.now()-ago;
   for(let i=BUF.frames.length-1;i>=0;i--) if(BUF.frames[i].t<=t) return BUF.frames[i].c;
   return BUF.frames[0]?.c||null;
 }
-function feedSource(){
-  if(FS.mode==='live' || !BUF.frames.length) return video;
-  if(FS.mode==='stare') return BUF.starer || frameAt(FS.delay) || video;
-  if(FS.mode==='ghost') return frameAt(FS.ghostAgo) || video;
-  return frameAt(FS.delay) || video;
+function setMode(m,o={}){ Object.assign(FS,{mode:m,since:performance.now()},o); if(m!=='shy') FS.held=null; }
+const lookingAway=()=>performance.now()-V.lastFaceAt>600 || Math.abs(V.yaw)>.5;
+// draws whatever CAM 07 is pretending to be. returns true only when it's the honest live picture
+function drawSrc(ctx,W,H,filter,src,sr,mirror=true){
+  ctx.save(); ctx.filter=filter;
+  if(mirror){ ctx.translate(W,0); ctx.scale(-1,1); }
+  sr ? ctx.drawImage(src,sr[0],sr[1],sr[2],sr[3],0,0,W,H) : ctx.drawImage(src,0,0,W,H);
+  ctx.restore();
+}
+const FT=document.createElement('canvas'), FTX=FT.getContext('2d');
+function drawHeldFace(ctx,W,H,filter){
+  // your face from the staring frame, pasted over your live head. it follows you. it doesn't look where you look.
+  if(!V.face || !BUF.starer || !BUF.starerBox || !faceFresh(400)) return;
+  const r=faceRect(V.face,W,H), [sx,sy,sw,sh]=BUF.starerBox, k=1.45;
+  const tw=r.w*k, th=r.h*k, SW=sw*k, SH=sh*k;
+  FT.width=Math.max(2,tw|0); FT.height=Math.max(2,th|0);
+  FTX.save(); FTX.translate(FT.width,0); FTX.scale(-1,1);
+  FTX.drawImage(BUF.starer,sx+sw/2-SW/2,sy+sh/2-SH/2,SW,SH,0,0,FT.width,FT.height); FTX.restore();
+  const g=FTX.createRadialGradient(FT.width/2,FT.height/2,Math.min(FT.width,FT.height)*.28,FT.width/2,FT.height/2,Math.max(FT.width,FT.height)*.5);
+  g.addColorStop(0,'#000'); g.addColorStop(1,'rgba(0,0,0,0)');
+  FTX.globalCompositeOperation='destination-in'; FTX.fillStyle=g; FTX.fillRect(0,0,FT.width,FT.height); FTX.globalCompositeOperation='source-over';
+  ctx.save(); ctx.filter=filter; ctx.drawImage(FT,r.x+r.w/2-tw/2,r.y+r.h/2-th/2,tw,th); ctx.restore();
+}
+function drawCam(ctx,W,H,filter,now){
+  const m=FS.mode;
+  if(m==='live' || !BUF.frames.length){ drawSrc(ctx,W,H,filter,video,null,!FS.unmirror); return !FS.unmirror; }
+  if(m==='delay'){ drawSrc(ctx,W,H,filter,frameAt(FS.delay)||video); return false; }
+  if(m==='echo'){
+    drawSrc(ctx,W,H,filter,video);
+    ctx.save(); ctx.globalAlpha=.5; drawSrc(ctx,W,H,filter,frameAt(FS.delay)||video); ctx.globalAlpha=.25; drawSrc(ctx,W,H,filter,frameAt(FS.delay*2)||video); ctx.restore();
+    return false;
+  }
+  if(m==='face'){ drawSrc(ctx,W,H,filter,video); drawHeldFace(ctx,W,H,filter); return false; }
+  if(m==='stare' && BUF.starer){
+    // the staring frame, slowly pushing in on your face
+    const S2=BUF.starer, b=BUF.starerBox, t=Math.min(1,(now-FS.since)/9000), z=1+.8*t*t;
+    const cx=b?b[0]+b[2]/2:S2.width/2, cy=b?b[1]+b[3]/2:S2.height/2;
+    const sw=S2.width/z, sh=S2.height/z, j=(Math.random()-.5)*2*t;
+    drawSrc(ctx,W,H,filter,S2,[clamp(cx-sw/2+j,0,S2.width-sw),clamp(cy-sh/2+j,0,S2.height-sh),sw,sh]);
+    return false;
+  }
+  if(m==='shy'){
+    // the feed only moves while you aren't looking at it
+    if(lookingAway()){ FS.held=null; drawSrc(ctx,W,H,filter,video); }
+    else {
+      if(!FS.held){ FS.held=document.createElement('canvas'); FS.held.width=W; FS.held.height=H; drawSrc(FS.held.getContext('2d'),W,H,'none',video); FS.onHold&&FS.onHold(); }
+      ctx.save(); ctx.filter=filter; ctx.drawImage(FS.held,0,0); ctx.restore();
+    }
+    return false;
+  }
+  if(m==='ghost'){
+    const RW=1100, e=now-FS.since;
+    if(e<RW){
+      // rewinding
+      const ago=FS.ghostAgo*(e/RW);
+      drawSrc(ctx,W,H,filter,frameAt(ago)||video);
+      for(let i=0;i<6;i++){ const y=Math.random()*H, h=4+Math.random()*18; ctx.drawImage(ctx.canvas,0,y,W,h,(Math.random()-.5)*90,y,W,h); }
+      ctx.fillStyle='rgba(255,255,255,.08)'; ctx.fillRect(0,(now/3)%H,W,26);
+      ctx.font='bold 34px "VT323",monospace'; ctx.fillStyle='#fff'; ctx.fillText('◀◀  REW',W/2-60,H/2);
+    } else drawSrc(ctx,W,H,filter,frameAt(FS.ghostAgo)||video);
+    return false;
+  }
+  drawSrc(ctx,W,H,filter,video); return true;
+}
+// noise is pre-rendered once instead of hundreds of fillRects a frame
+const NOISE=[];
+function noiseTile(heavy){
+  if(!NOISE.length){
+    for(let n=0;n<8;n++){
+      const c=document.createElement('canvas'); c.width=360; c.height=270; const x=c.getContext('2d'), d=x.createImageData(360,270);
+      for(let i=0;i<d.data.length;i+=4){ if(Math.random()<.035){ const v=Math.random()*255|0; d.data[i]=d.data[i+1]=d.data[i+2]=v; d.data[i+3]=255; } }
+      x.putImageData(d,0,0); NOISE.push(c);
+    }
+  }
+  return NOISE[Math.random()*NOISE.length|0];
 }
 const fig={p:0,on:false,side:1,hidden:false};
 let hud=false;
@@ -459,8 +533,8 @@ function drawFeed(f,now){
   const {ctx,c}=f, W=c.width, H=c.height;
   const camOk=camOn && video.readyState>=2;
   const FILTER='grayscale(1) contrast(1.35) brightness(.72)';
-  const src=f.still?video:feedSource(), live=src===video;
-  if(camOk) drawVideo(ctx,W,H,FILTER,src); else { ctx.fillStyle='#0c0c0c'; ctx.fillRect(0,0,W,H); }
+  let live=true;
+  if(camOk) live=drawCam(ctx,W,H,FILTER,now); else { ctx.fillStyle='#0c0c0c'; ctx.fillRect(0,0,W,H); }
   // the figure, layered behind the player when segmentation is live
   if(fig.on && !fig.hidden && Math.random()>.08){
     drawFigure(ctx,W,H);
@@ -476,31 +550,13 @@ function drawFeed(f,now){
   }
   if(hud && camOk && live) drawHUD(ctx,W,H);
   const heavy=!camOk;
-  for(let i=0;i<(heavy?5000:900);i++){ const v=Math.random()*255|0; ctx.fillStyle=`rgba(${v},${v},${v},${heavy?.9:.2})`; ctx.fillRect(Math.random()*W,Math.random()*H,2,2); }
+  ctx.save(); ctx.globalAlpha=heavy?.95:.35; ctx.drawImage(noiseTile(),0,0,W,H); if(heavy){ ctx.drawImage(noiseTile(),0,0,W,H); ctx.drawImage(noiseTile(),0,0,W,H); } ctx.restore();
   if(Math.random()<.06){ const y=Math.random()*(H-24); ctx.drawImage(c,0,y,W,22,(Math.random()-.5)*40,y,W,22); }
   ctx.font='bold 16px "IBM Plex Mono",monospace'; ctx.fillStyle='#fff';
   ctx.fillText(f.label,14,26);
   if((now/500|0)%2){ ctx.fillStyle='#f33'; ctx.beginPath(); ctx.arc(W-72,21,6,0,7); ctx.fill(); }
   ctx.fillStyle='#fff'; ctx.fillText('REC',W-60,26); ctx.fillText(timestamp(!live&&FS.mode==='ghost'?FS.ghostAgo:0),14,H-16);
-}
-function makeStillFeed(label,img){
-  const c=document.createElement('canvas'); c.className='feed';
-  c.width=720; c.height=Math.round(720*img.height/img.width);
-  dock.appendChild(c); scrollDown();
-  const f={c,ctx:c.getContext('2d'),label,live:true,raf:0,F:{p:.06,side:Math.random()<.5?1:-1}};
-  const loop=now=>{
-    if(!f.live) return;
-    const {ctx}=f, W=c.width, H=c.height;
-    ctx.save(); ctx.filter='grayscale(1) contrast(1.35) brightness(.72)'; ctx.drawImage(img,0,0,W,H); ctx.restore();
-    if(Math.random()>.06) drawFigure(ctx,W,H,f.F,true);
-    for(let i=0;i<900;i++){ const v=Math.random()*255|0; ctx.fillStyle=`rgba(${v},${v},${v},.2)`; ctx.fillRect(Math.random()*W,Math.random()*H,2,2); }
-    if(Math.random()<.06){ const y=Math.random()*(H-24); ctx.drawImage(c,0,y,W,22,(Math.random()-.5)*40,y,W,22); }
-    ctx.font='bold 16px "IBM Plex Mono",monospace'; ctx.fillStyle='#fff'; ctx.fillText(f.label,14,26);
-    if((now/500|0)%2){ ctx.fillStyle='#f33'; ctx.beginPath(); ctx.arc(W-72,21,6,0,7); ctx.fill(); }
-    ctx.fillStyle='#fff'; ctx.fillText('REC',W-60,26); ctx.fillText(timestamp(),14,H-16);
-    f.raf=requestAnimationFrame(loop);
-  };
-  f.raf=requestAnimationFrame(loop); feeds.push(f); return f;
+  if(!live && FS.mode==='ghost' && now-FS.since>1100){ ctx.fillText('▶ PLAYBACK',W-130,H-16); }
 }
 // a short full-screen hit, used when it gets through the door
 async function flashScare(text){
@@ -678,7 +734,7 @@ const OPT={
   rear: !params.has('norear') && !CRASH.rear,
   qwen: params.has('noqwen') ? 'none' : aiCrashes>=2 ? 'none' : aiCrashes===1 ? 'small' : 'full',
 };
-const STAGE_NAME={rear:'switching to the back camera', models:'loading the AI models', analyse:'the AI analysing the camera'};
+const STAGE_NAME={rear:'switching cameras', models:'loading the AI models', analyse:'the AI analysing the camera'};
 const aiEl=document.getElementById('ai');
 function aiStatus(t){ aiEl.textContent=t?('SCENE AI · '+t):''; }
 let aiWorker=null, rpcId=0; const rpcPending=new Map();
@@ -1284,38 +1340,85 @@ async function hunt(vis){
 }
 
 // ---------------------------------------------------------------- the feed stops being you
-async function desync(){
+async function desync(SC){
+  const wasWatching=watching; watching=false;   // it's going to ask you to look away. don't nag about it
   // 1. the lag creeps in. no announcement
-  FS.mode='delay'; FS.delay=0;
-  const ramp=setInterval(()=>{ FS.delay=Math.min(3000,FS.delay+120); },500);
+  setMode('delay',{delay:0});
+  const ramp=setInterval(()=>{ FS.delay=Math.min(2600,FS.delay+40); },100);
   await type('the feed on CAM 07 settles. the static clears.',{cls:'dim'});
-  await type('it\'s very quiet for a while.',{pause:2500});
+  await type('it\'s very quiet for a while.',{pause:2600});
   await type('turn your head to the side. watch the feed while you do it.');
   const turned=await waitFor(()=>Math.abs(V.yaw)>.4,10000);
   if(turned){
     await waitFor(()=>Math.abs(V.yaw)<.2,6000);
-    await sleep(Math.max(800,FS.delay));
+    await sleep(Math.max(900,FS.delay));
     await type('it turned late, didn\'t it.',{cls:'red'});
     await type('only a little. it\'s still learning how you move.');
   } else await type('you didn\'t move. the feed did anyway.',{cls:'red'});
-  clearInterval(ramp); FS.delay=Math.max(FS.delay,2500);
-  // 2. it stops copying you
-  if(BUF.starer){
-    await type('now look away from the screen. just for a second.');
-    const away=await waitFor(()=>performance.now()-V.lastFaceAt>600 || Math.abs(V.yaw)>.55,10000);
-    FS.mode='stare';
-    if(away) await waitFor(()=>performance.now()-V.lastFaceAt<300 && Math.abs(V.yaw)<.3,8000);
-    await type(away?'you looked away. it didn\'t.':'you didn\'t look away. it wouldn\'t have either.',{cls:'red'});
-    await type('it\'s still looking straight down the lens. it hasn\'t blinked.',{pause:2500});
+  clearInterval(ramp);
+
+  // 2. two of you
+  setMode('echo',{delay:450}); glitch();
+  await type('there are two of you on the feed now.',{cls:'red'});
+  await type('move your head from side to side.');
+  await sleep(4500);
+  await type('one of you is slower than the other. it\'s catching up.',{pause:1500});
+
+  // 3. the wrong hand
+  setMode('live',{unmirror:true});
+  await type('the feed sharpens. that\'s better. that\'s you.');
+  await type('raise your right hand. keep looking at the feed.',{pause:2600});
+  const hand=await choose(['It raised its right hand','It raised its left hand']);
+  await type(hand===0?'look again.':'yes.',{cls:'red'});
+  await type('it\'s not a mirror. it never was. it\'s a window, and something is on the other side copying you.',{cls:'red',pause:900});
+  FS.unmirror=false;
+
+  // 4. it keeps your face
+  if(BUF.starer && BUF.starerBox){
+    setMode('face'); glitch();
+    await type('now move your head around. slowly. look left. look right. look down.');
+    await sleep(6500);
+    await type('your face didn\'t move with you.',{cls:'red'});
+    await type('it kept the one that was looking at it.',{cls:'red',pause:1200});
   }
-  // 3. a replay, with company
-  FS.mode='ghost'; FS.ghostAgo=Math.min(20000,(BUF.frames.length/6|0)*1000-2000);
-  placeFigure(); fig.p=.45; fig.on=true; glitch(); thump();
-  await type(`the timestamp jumps back ${Math.round(FS.ghostAgo/1000)} seconds.`,{cls:'dim'});
-  await type('that\'s you, a little while ago. look who\'s standing behind you.',{cls:'red',pause:3500});
-  fig.on=false; FS.mode='delay'; FS.delay=1500;
+
+  // 5. it doesn't look away
+  if(BUF.starer){
+    setMode('delay',{delay:1200});
+    await type('look away from the screen. just for a second.');
+    const away=await waitFor(lookingAway,10000);
+    setMode('stare');
+    if(away) await waitFor(()=>!lookingAway(),8000);
+    await type(away?'you looked away. it didn\'t.':'you didn\'t look away. it wouldn\'t have either.',{cls:'red'});
+    await type('it\'s still looking straight down the lens. it hasn\'t blinked. it\'s getting closer to the glass.',{pause:3500});
+  }
+
+  // 6. it only moves when you aren't watching
+  placeFigure(); fig.p=.12; fig.on=true;
+  let moves=0;
+  setMode('shy',{onHold:()=>{ moves++; fig.p=Math.min(.75,fig.p+.16); thump(); }});
+  FS.held=null;
+  await type('the feed only updates when you aren\'t looking at it.',{cls:'dim'});
+  await type('so does it.',{cls:'red'});
+  await type('look away, then look back. you\'ll want to see where it went.');
+  const t0=performance.now();
+  while(performance.now()-t0<16000 && moves<4) await sleep(100);
+  await type(moves>=3?'it\'s been patient. you haven\'t.':moves?'closer.':'you won\'t look away. it can wait longer than you can.',{cls:'red',pause:900});
+
+  // 7. the tape
+  fig.on=false;
+  if(bufSpan()>4000){
+    const ago=Math.min(9000,bufSpan()-800);
+    setMode('ghost',{ghostAgo:ago}); glitch(); thump();
+    await type('the tape rewinds by itself.',{cls:'dim',pause:1100});
+    fig.p=.5; fig.on=true;
+    await type(`that's you, ${Math.round(ago/1000)} seconds ago. look who's standing next to you.`,{cls:'red',pause:3200});
+    fig.on=false;
+  }
+  setMode('delay',{delay:1200});
   await type('that isn\'t you on the feed.',{cls:'red',speed:40});
   await type('that hasn\'t been you since 03:00.',{cls:'red',speed:40,pause:1200});
+  watching=wasWatching;
 }
 
 // ---------------------------------------------------------------- it hunts by sound
@@ -1365,17 +1468,16 @@ const DESC={
 
 async function intro(){
   out.innerHTML='';
-  addLine('NIGHTWATCH','big'); gap();
+  addLine('NIGHTWATCH','big'); addLine('build 5','dim'); gap();
   if(MEM) addLine(`welcome back, operator. this is shift ${MEM.runs+1}. endings found: ${(MEM.found||[]).length}/3.`,'red');
   if(crashedAt) addLine(`last time the page crashed while ${STAGE_NAME[crashedAt]||crashedAt}.`,'red');
-  const off=[!OPT.rear&&'back camera', OPT.qwen==='small'&&'big AI model (using the small one)', OPT.qwen==='none'&&'Qwen AI'].filter(Boolean);
+  const off=[!OPT.rear&&'the second camera', OPT.qwen==='small'&&'big AI model (using the small one)', OPT.qwen==='none'&&'Qwen AI'].filter(Boolean);
   if(off.length){ addLine('safe mode: switched off '+listify(off)+'.','red'); addLine('to try everything again, add ?reset to the end of the address.','dim'); gap(); }
   addLine('a text horror game. about fifteen minutes.');
   addLine('headphones on. lights off if you think you\'re tough.'); gap();
-  addLine('this game watches you through your webcam the whole time.','dim');
+  addLine('this game watches you through your device\'s cameras the whole time.','dim');
   addLine('it tracks your face, eyes and expression live, and works out where you are, what you\'re','dim');
   addLine('wearing and what\'s behind you. the story reacts to all of it.','dim');
-  addLine('if your device has a back camera, it takes one picture with it, to see what\'s in front of you.','dim');
   addLine('it may ask for your microphone too. that\'s only used for volume.','dim');
   addLine('all of it runs on this computer. nothing is recorded, saved or uploaded.','dim');
   addLine('first run downloads the AI models (about 400MB, or around 2GB with a decent GPU) and caches them. you need internet.','dim');
@@ -1544,28 +1646,21 @@ async function game(wantCam){
     await type('no picture. just static.');
     await type('but there\'s a rhythm in the static. it matches your breathing.',{pause:1200});
   }
-  // ---- CAM 08: the rear camera picture, with it standing in it
-  if(vis && S.rearImg){
+  // ---- it knows what's in front of you (taken from the rear camera; the player never sees it)
+  const fl=vis?frontLines():[];
+  if(fl.length){
     gap();
-    await type('a second feed connects underneath it.',{cls:'dim'});
-    const sf=makeStillFeed('CAM 08  [REAR SENSOR]',S.rearImg); await sleep(1600);
-    await type('that isn\'t the building either.');
-    await type('that\'s the other side of your screen. that\'s what\'s in front of you.',{cls:'red',pause:900});
-    sf.F.p=.25;
-    const fl=frontLines();
-    if(fl.length){ for(const l of fl){ await type(l,{cls:'red',speed:30,pause:800}); sf.F.p=Math.min(.75,sf.F.p+.2); } }
-    else await type('something is standing in it. look closer.',{cls:'red',pause:800});
-    sf.F.p=.85;
+    await type('it doesn\'t only see you.',{pause:700});
+    await type('it can see what you\'re looking at. the other side of your screen.',{cls:'red',pause:900});
+    for(const l of fl) await type(l,{cls:'red',speed:30,pause:800});
     await type('don\'t look up from the screen. if you look up, it knows you know.',{pause:200});
     if(V.face){
       const looked=await waitFor(()=>performance.now()-V.lastFaceAt>700 || Math.abs(V.yaw)>.6 || Math.abs(V.pitch)>.45,6000);
       if(looked){ SC.lookedUp=true; glitch(); thump(); await type('you looked. it saw you look.',{cls:'red',pause:900}); }
       else await type('good. eyes down. it\'s still there.');
     } else await sleep(4000);
-    closeFeed(sf,'CAM 08  ·  SIGNAL LOST');
-    await type('CAM 07 is still live next to it. you should keep watching that one.',{cls:'dim'});
   }
-  if(vis && camOn && BUF.frames.length>30) await desync();
+  if(vis && camOn && bufSpan()>3000) await desync(SC);
   placeFigure(); fig.p=.05; fig.on=true; wantSeg=true; await sleep(2000);
   await type('there\'s something in the background. no, don\'t check. keep looking at the screen.',{pause:900});
   hud=false; segEvery=300;
@@ -1593,7 +1688,7 @@ async function game(wantCam){
   fig.p=Math.max(fig.p,.3);
   await type('it\'s closer now.',{pause:900});
 
-  FS.mode='live';
+  setMode('live');
   // ---- don't blink
   const canSeeEyes = vis && V.openBase>0 && faceFresh(2000);
   if(canSeeEyes){
@@ -1731,7 +1826,7 @@ async function game(wantCam){
   }
   if(vis && S.faceCaption){ gap(); await type('SUBJECT DESCRIPTION',{cls:'white',pause:150}); await type('  '+S.faceCaption,{cls:'dim',speed:6,pause:300}); }
   if(vis && S.caption){ gap(); await type('SCENE DESCRIPTION',{cls:'white',pause:150}); await type('  '+S.caption,{cls:'dim',speed:6,pause:300}); }
-  if(vis && S.frontCaption){ gap(); await type('IN FRONT OF YOU',{cls:'white',pause:150}); await type('  '+S.frontCaption,{cls:'dim',speed:6,pause:300}); }
+  if(vis && S.frontCaption){ gap(); await type('IN FRONT OF YOU  (rear camera)',{cls:'white',pause:150}); await type('  '+S.frontCaption,{cls:'dim',speed:6,pause:300}); }
   gap();
   await type('(camera\'s off. nothing was recorded. sleep well, or don\'t.)',{cls:'dim',speed:15});
   await choose(['Play again']);
@@ -1763,20 +1858,13 @@ async function boot(){
   if(got) await dumpModels('CALIBRATION :: RAW OUTPUT');
   await type('capturing environment for analysis...',{cls:'dim',pause:100});
   const snap=snapshot(); wantSeg=false; S.base=snap.metrics;
-  if(OPT.rear){
-    const rl=addLine('  rear sensor ............. checking','dim');
-    stage('rear');
-    snap.rear=await Promise.race([rearSnap(), sleep(20000).then(()=>null)]);
-    stage(null);
-    rl.textContent='  rear sensor ............. '+(snap.rear?'captured':location.protocol==='file:'?'unavailable (open the game from a web address, not a file)':'not found');
-  } else addLine('  rear sensor ............. off','dim');
-  S.rearImg=snap.rear||null;
   addLine(`  scene models ............ loading in background${OPT.qwen==='small'?' (small mode)':OPT.qwen==='none'?' (safe mode, no qwen)':''}`,'dim');
-  analyse(snap);
   addLine('  > frame captured. analysis runs in the background. nothing leaves this computer.','dim');
   addLine('  > first run downloads the scene models. progress is shown top right.','dim');
   await sleep(1400);
   hud=false; closeFeed(cal,'CALIBRATION COMPLETE');
+  if(OPT.rear){ stage('rear'); snap.rear=await Promise.race([rearSnap(), sleep(12000).then(()=>null)]); stage(null); }
+  analyse(snap);
   await type('calibration complete. thank you, operator.',{cls:'dim'}); gap();
   return true;
 }
