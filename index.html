@@ -19,8 +19,8 @@
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:var(--body)}
 body{overflow:hidden}
-#term{position:fixed;inset:0;overflow-y:auto;padding:24px 16px 190px}
-#out{max-width:760px;margin:0 auto;font-size:15px;line-height:1.6;text-shadow:0 0 6px rgba(140,255,140,.28)}
+#term{position:fixed;inset:0;overflow-y:auto;padding:0 16px 190px}
+#out{max-width:760px;margin:0 auto;padding-top:24px;font-size:15px;line-height:1.6;text-shadow:0 0 6px rgba(140,255,140,.28)}
 .line{white-space:pre-wrap;overflow-wrap:anywhere;min-height:1.6em}
 .dim{color:var(--dim)}
 .red{color:var(--red);text-shadow:0 0 8px rgba(255,60,50,.55)}
@@ -31,6 +31,9 @@ body{overflow:hidden}
 button{font:inherit;font-size:15px;background:var(--panel);color:var(--fg);border:1px solid var(--dim);padding:11px 16px;cursor:pointer}
 button:hover,button:focus-visible{border-color:var(--fg);background:#0f1c10;outline:none}
 canvas.feed{width:100%;max-width:680px;display:block;border:1px solid var(--dim);background:#000;margin:12px 0}
+#dock{position:sticky;top:0;z-index:5;margin:0 -16px;padding:12px 16px 0;display:flex;gap:8px;justify-content:center;align-items:flex-start;background:var(--bg);box-shadow:0 10px 14px -6px var(--bg)}
+#dock:empty{display:none}
+#dock canvas.feed{width:auto;max-width:100%;max-height:42vh;min-width:0;flex:0 1 auto;margin:0 0 8px}
 #scare{position:fixed;inset:0;z-index:100;background:#000;display:none}
 #scare canvas{width:100%;height:100%;display:block}
 #crt{position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(0,0,0,.3) 0 1px,transparent 1px 3px);z-index:50}
@@ -39,11 +42,14 @@ canvas.feed{width:100%;max-width:680px;display:block;border:1px solid var(--dim)
 @keyframes gl{0%{transform:translate(3px,-2px)}50%{transform:translate(-4px,2px)}100%{transform:none}}
 #ai{position:fixed;top:10px;right:12px;z-index:60;font-size:12px;color:var(--dim);background:rgba(5,8,5,.85);border:1px solid #1f2d20;padding:4px 8px;font-variant-numeric:tabular-nums;max-width:calc(100vw - 24px)}
 #ai:empty{display:none}
+.hunt{border:1px solid var(--dim);background:var(--panel);padding:10px 12px;margin:10px 0;font-variant-numeric:tabular-nums;white-space:pre-wrap;overflow-wrap:anywhere}
+.hunt .warn{color:var(--red)}
+button:disabled{opacity:.4;cursor:default}
 @media (prefers-reduced-motion:reduce){.glitch{animation:none}}
 </style>
 </head>
 <body>
-<div id="term"><div id="out"></div></div>
+<div id="term"><div id="dock"></div><div id="out"></div></div>
 <div id="choices"></div>
 <div id="ai" aria-live="polite"></div>
 <div id="scare"><canvas></canvas></div>
@@ -152,7 +158,7 @@ onmessage=async e=>{
 // =====================================================================
 // core text engine
 // =====================================================================
-const out=document.getElementById('out'), term=document.getElementById('term'), choicesEl=document.getElementById('choices');
+const dock=document.getElementById('dock'), out=document.getElementById('out'), term=document.getElementById('term'), choicesEl=document.getElementById('choices');
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const frame=()=>new Promise(r=>requestAnimationFrame(r));
 const lerp=(a,b,t)=>a+(b-a)*Math.max(0,Math.min(1,t));
@@ -190,7 +196,7 @@ function choose(opts){
 function glitch(){ out.classList.remove('glitch'); void out.offsetWidth; out.classList.add('glitch'); }
 const pad=n=>String(n).padStart(2,'0');
 const nowHM=()=>{ const d=new Date(); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
-const timestamp=()=>{ const d=new Date(); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}  ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; };
+const timestamp=(off=0)=>{ const d=new Date(Date.now()-off); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}  ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; };
 const listify=a=>a.length<2?(a[0]||''):a.slice(0,-1).join(', ')+' and '+a[a.length-1];
 const pct=v=>Math.round(v*100)+'%';
 
@@ -391,13 +397,48 @@ const pickOne=a=>a[Math.random()*a.length|0];
 // rendering a live CCTV feed (with optional analysis HUD and the figure)
 // =====================================================================
 const feeds=[];
+const BUF={frames:[],on:false,timer:0,starer:null,starerAt:0};
+const FS={mode:'live',delay:0,ghostAgo:0};   // what CAM 07 is really showing
+function startBuffer(){
+  if(BUF.on || !camOn) return; BUF.on=true;
+  const loop=()=>{
+    if(!BUF.on) return;
+    if(camOn && video.readyState>=2 && video.videoWidth){
+      const now=performance.now();
+      const c=BUF.frames.length>=150 ? BUF.frames.shift().c : document.createElement('canvas');
+      c.width=320; c.height=Math.round(320*video.videoHeight/video.videoWidth);
+      c.getContext('2d').drawImage(video,0,0,c.width,c.height);
+      BUF.frames.push({c,t:now});
+      // keep one good frame of you looking straight down the lens
+      if(V.face && now-V.lastFaceAt<300 && Math.abs(V.yaw)<.2 && !V.closed && now-BUF.starerAt>1000){
+        BUF.starer ||= document.createElement('canvas');
+        BUF.starer.width=640; BUF.starer.height=Math.round(640*video.videoHeight/video.videoWidth);
+        BUF.starer.getContext('2d').drawImage(video,0,0,BUF.starer.width,BUF.starer.height); BUF.starerAt=now;
+      }
+    }
+    BUF.timer=setTimeout(loop,166);
+  };
+  loop();
+}
+function stopBuffer(){ BUF.on=false; clearTimeout(BUF.timer); BUF.frames=[]; BUF.starer=null; FS.mode='live'; }
+function frameAt(ago){
+  const t=performance.now()-ago;
+  for(let i=BUF.frames.length-1;i>=0;i--) if(BUF.frames[i].t<=t) return BUF.frames[i].c;
+  return BUF.frames[0]?.c||null;
+}
+function feedSource(){
+  if(FS.mode==='live' || !BUF.frames.length) return video;
+  if(FS.mode==='stare') return BUF.starer || frameAt(FS.delay) || video;
+  if(FS.mode==='ghost') return frameAt(FS.ghostAgo) || video;
+  return frameAt(FS.delay) || video;
+}
 const fig={p:0,on:false,side:1,hidden:false};
 let hud=false;
 function makeFeed(label){
   const c=document.createElement('canvas'); c.className='feed';
   const vw=video.videoWidth||640, vh=video.videoHeight||480;
   c.width=720; c.height=Math.round(720*vh/vw);
-  out.appendChild(c); scrollDown();
+  dock.appendChild(c); scrollDown();
   const f={c,ctx:c.getContext('2d'),label,live:true,raf:0};
   const off=document.createElement('canvas'); off.width=c.width; off.height=c.height; f.off=off; f.offx=off.getContext('2d');
   const loop=now=>{ if(!f.live) return; drawFeed(f,now); f.raf=requestAnimationFrame(loop); };
@@ -407,21 +448,24 @@ function closeFeed(f,msg='SIGNAL CLOSED'){
   f.live=false; cancelAnimationFrame(f.raf);
   const {ctx,c}=f; ctx.fillStyle='rgba(0,0,0,.65)'; ctx.fillRect(0,0,c.width,c.height);
   ctx.fillStyle='#fff'; ctx.font='bold 22px "IBM Plex Mono",monospace'; ctx.textAlign='center'; ctx.fillText(msg,c.width/2,c.height/2); ctx.textAlign='left';
+  // once it's dead, it leaves the dock and stays in the log
+  setTimeout(()=>{ if(c.parentNode===dock){ if(running){ out.appendChild(c); scrollDown(); } else c.remove(); } },1500);
 }
-function drawVideo(ctx,W,H,filter){
-  ctx.save(); ctx.filter=filter; ctx.translate(W,0); ctx.scale(-1,1); ctx.drawImage(video,0,0,W,H); ctx.restore();
+function drawVideo(ctx,W,H,filter,src=video){
+  ctx.save(); ctx.filter=filter; ctx.translate(W,0); ctx.scale(-1,1); ctx.drawImage(src,0,0,W,H); ctx.restore();
 }
 function faceRect(f,W,H){ const [x,y,w,h]=f.box; const [x1,y1]=toCanvas(x+w,y,W,H); return {x:x1,y:y1,w:w*W/video.videoWidth,h:h*H/video.videoHeight}; }
 function drawFeed(f,now){
   const {ctx,c}=f, W=c.width, H=c.height;
   const camOk=camOn && video.readyState>=2;
   const FILTER='grayscale(1) contrast(1.35) brightness(.72)';
-  if(camOk) drawVideo(ctx,W,H,FILTER); else { ctx.fillStyle='#0c0c0c'; ctx.fillRect(0,0,W,H); }
+  const src=f.still?video:feedSource(), live=src===video;
+  if(camOk) drawVideo(ctx,W,H,FILTER,src); else { ctx.fillStyle='#0c0c0c'; ctx.fillRect(0,0,W,H); }
   // the figure, layered behind the player when segmentation is live
   if(fig.on && !fig.hidden && Math.random()>.08){
     drawFigure(ctx,W,H);
     const maskFresh = V.mask && now-V.maskAt<700;
-    if(camOk && maskFresh){
+    if(camOk && maskFresh && live){
       const o=f.offx; o.globalCompositeOperation='source-over'; o.clearRect(0,0,W,H);
       drawVideo(o,W,H,FILTER);
       o.globalCompositeOperation='destination-in';
@@ -430,14 +474,47 @@ function drawFeed(f,now){
       ctx.drawImage(f.off,0,0);
     }
   }
-  if(hud && camOk) drawHUD(ctx,W,H);
+  if(hud && camOk && live) drawHUD(ctx,W,H);
   const heavy=!camOk;
   for(let i=0;i<(heavy?5000:900);i++){ const v=Math.random()*255|0; ctx.fillStyle=`rgba(${v},${v},${v},${heavy?.9:.2})`; ctx.fillRect(Math.random()*W,Math.random()*H,2,2); }
   if(Math.random()<.06){ const y=Math.random()*(H-24); ctx.drawImage(c,0,y,W,22,(Math.random()-.5)*40,y,W,22); }
   ctx.font='bold 16px "IBM Plex Mono",monospace'; ctx.fillStyle='#fff';
   ctx.fillText(f.label,14,26);
   if((now/500|0)%2){ ctx.fillStyle='#f33'; ctx.beginPath(); ctx.arc(W-72,21,6,0,7); ctx.fill(); }
-  ctx.fillStyle='#fff'; ctx.fillText('REC',W-60,26); ctx.fillText(timestamp(),14,H-16);
+  ctx.fillStyle='#fff'; ctx.fillText('REC',W-60,26); ctx.fillText(timestamp(!live&&FS.mode==='ghost'?FS.ghostAgo:0),14,H-16);
+}
+function makeStillFeed(label,img){
+  const c=document.createElement('canvas'); c.className='feed';
+  c.width=720; c.height=Math.round(720*img.height/img.width);
+  dock.appendChild(c); scrollDown();
+  const f={c,ctx:c.getContext('2d'),label,live:true,raf:0,F:{p:.06,side:Math.random()<.5?1:-1}};
+  const loop=now=>{
+    if(!f.live) return;
+    const {ctx}=f, W=c.width, H=c.height;
+    ctx.save(); ctx.filter='grayscale(1) contrast(1.35) brightness(.72)'; ctx.drawImage(img,0,0,W,H); ctx.restore();
+    if(Math.random()>.06) drawFigure(ctx,W,H,f.F,true);
+    for(let i=0;i<900;i++){ const v=Math.random()*255|0; ctx.fillStyle=`rgba(${v},${v},${v},.2)`; ctx.fillRect(Math.random()*W,Math.random()*H,2,2); }
+    if(Math.random()<.06){ const y=Math.random()*(H-24); ctx.drawImage(c,0,y,W,22,(Math.random()-.5)*40,y,W,22); }
+    ctx.font='bold 16px "IBM Plex Mono",monospace'; ctx.fillStyle='#fff'; ctx.fillText(f.label,14,26);
+    if((now/500|0)%2){ ctx.fillStyle='#f33'; ctx.beginPath(); ctx.arc(W-72,21,6,0,7); ctx.fill(); }
+    ctx.fillStyle='#fff'; ctx.fillText('REC',W-60,26); ctx.fillText(timestamp(),14,H-16);
+    f.raf=requestAnimationFrame(loop);
+  };
+  f.raf=requestAnimationFrame(loop); feeds.push(f); return f;
+}
+// a short full-screen hit, used when it gets through the door
+async function flashScare(text){
+  const sc=document.getElementById('scare'), c=sc.querySelector('canvas');
+  c.width=innerWidth; c.height=innerHeight; const x=c.getContext('2d'), w=c.width, h=c.height;
+  sc.style.display='block'; sting(); glitch();
+  const F={p:.97,side:Math.random()<.5?1:-1}, t0=performance.now();
+  await new Promise(res=>{ const f=now=>{
+    x.setTransform(1,0,0,1,(Math.random()-.5)*40,(Math.random()-.5)*40);
+    x.fillStyle=Math.random()<.5?'#000':'#2a0000'; x.fillRect(-40,-40,w+80,h+80);
+    x.save(); x.translate(w/2,0); x.scale(2.2,2.2); x.translate(-w/2,-h*.08); drawFigure(x,w,h,F,true); x.restore();
+    x.font=`${Math.min(w,h)*.14}px "VT323",monospace`; x.textAlign='center'; x.fillStyle='#fff'; x.fillText(text,w/2,h*.9);
+    now-t0<750?requestAnimationFrame(f):res(); }; requestAnimationFrame(f); });
+  x.setTransform(1,0,0,1,0,0); sc.style.display='none';
 }
 function brackets(ctx,x,y,w,h,len){
   ctx.beginPath();
@@ -480,16 +557,16 @@ function drawHUD(ctx,W,H){
   }
   ctx.restore();
 }
-function drawFigure(ctx,W,H){
-  const p=fig.p; let cx,top,hr;
-  const f=faceFresh() ? faceRect(V.face,W,H) : null;
+function drawFigure(ctx,W,H,F=fig,free=false){
+  const p=F.p; let cx,top,hr;
+  const f=!free && faceFresh() ? faceRect(V.face,W,H) : null;
   if(f){
     const fw=f.w, far=clamp(fw*2.4,W*.22,W*.4);
     hr=fw*lerp(.26,.6,p);
-    cx=f.x+f.w/2 + fig.side*lerp(far,fw*1.0,p);
+    cx=f.x+f.w/2 + F.side*lerp(far,fw*1.0,p);
     top=f.y + f.h*lerp(-.15,-.35,p);
   } else {
-    hr=34*lerp(.5,1.25,p); cx=W*lerp(.82,.66,p); if(fig.side<0) cx=W-cx; top=H*lerp(.3,.1,p);
+    hr=(W/21)*lerp(.5,1.25,p); cx=W*lerp(.82,.66,p); if(F.side<0) cx=W-cx; top=H*lerp(.3,.1,p);
   }
   cx=clamp(cx,hr,W-hr);
   ctx.save();
@@ -618,6 +695,8 @@ function getWorker(){
   aiWorker.onerror=e=>{ console.warn('ai worker',e.message||e); for(const p of rpcPending.values()) p.rej(new Error('ai worker failed')); rpcPending.clear(); };
   return aiWorker;
 }
+let rpcChain=Promise.resolve();
+function rpcQ(cmd,args,transfer){ const p=rpcChain.then(()=>rpc(cmd,args,transfer)); rpcChain=p.catch(()=>{}); return p; }
 function rpc(cmd,args={},transfer=[]){
   return new Promise((res,rej)=>{ const id=++rpcId; rpcPending.set(id,{res,rej}); getWorker().postMessage({id,cmd,args},transfer); });
 }
@@ -715,7 +794,7 @@ const hairText=()=>S.hairText||(S.hairLen&&S.hairColour?`${S.hairLen} ${S.hairCo
 async function ask(canvas,set,tmpl,name){
   const labels=set.map(x=>Array.isArray(x)?x[0]:x);
   const img=pixels(canvas);
-  const r=await rpc('clip',{img,labels,tmpl},[img.data]);
+  const r=await rpcQ('clip',{img,labels,tmpl},[img.data]);
   const top=r[0], item=set[labels.indexOf(top.label)];
   if(name) S.log.push(`[clip] ${name.padEnd(13)} ${r.slice(0,3).map(o=>`${disp(set[labels.indexOf(o.label)])} ${pct(o.score)}`).join(' | ')}`);
   return {item, score:top.score};
@@ -723,10 +802,64 @@ async function ask(canvas,set,tmpl,name){
 async function yes(canvas,a,b,name){ const r=await ask(canvas,[[a,'yes'],[b,'no']],'a photo of {}',name); return r.item[1]==='yes' && r.score>.62; }
 async function qwen(canvas,question,{max=140,sample=false,temp=.8}={}){
   const img=pixels(canvas,448,448);
-  return rpc('qwen',{img,question,max,sample,temp},[img.data]);
+  return rpcQ('qwen',{img,question,max,sample,temp},[img.data]);
 }
-const FACTS_PROMPT='Answer in JSON only, no other text. Keys: "top": what the person is wearing on their upper body, 2-4 words with colour, e.g. "grey hoodie". "hair": 2-5 words, e.g. "short light brown hair". "hood_up": true or false. "glasses": true or false. "headphones": true or false. "behind": an array of up to 4 specific objects that are clearly visible behind or around the person, 1-3 words each, e.g. ["wooden cabinet","white microwave"]. Only include things you can clearly see. Do not include clothing or body parts in "behind".';
-const cleanList=a=>(Array.isArray(a)?a:[]).map(x=>String(x).toLowerCase().trim().replace(/^(a|an|the) /,'')).filter(x=>x && x.length<30 && !PEOPLEWORDS.test(x));
+const PLACE_KEYS=()=>Object.keys(PLACE_LINE).join(', ');
+const FACTS_PROMPT_TXT=()=>`Answer in JSON only, no other text. Keys: "top": what the person is wearing on their upper body, 2-4 words with colour, e.g. "grey hoodie". "hair": 2-5 words, e.g. "short light brown hair". "hood_up": true or false. "glasses": true or false. "headphones": true or false. "place": where this photo was taken, exactly one of: ${PLACE_KEYS()}. "walls": the colour of the walls in one or two words, or null if you can't see them. "behind": an array of up to 4 specific objects clearly visible behind or around the person, 1-3 words each with colour where obvious, e.g. ["wooden cabinet","white microwave"]. Only include things you can clearly see. Do not include clothing or body parts in "behind".`;
+let FACTS_PROMPT='';
+const REAR_PROMPT=()=>`Answer in JSON only, no other text. This photo was taken by the back camera of someone's device, so it shows what they are facing. Keys: "place": exactly one of: ${PLACE_KEYS()}. "objects": an array of up to 5 specific objects clearly visible, 1-3 words each with colour where obvious, e.g. "white door", "black backpack". No people or body parts. "closest": the single most noticeable object, 1-3 words. "detail": one short, specific, slightly unsettling observation about something actually in this photo, under 12 words, lowercase, e.g. "the door on the left is open a few centimetres".`;
+const cleanItem=x=>String(x||'').toLowerCase().trim().replace(/^(a|an|the) /,'').replace(/[."]+$/,'');
+const cleanList=a=>[...new Set((Array.isArray(a)?a:[]).map(cleanItem))].filter(x=>x && x.length<30 && !PEOPLEWORDS.test(x));
+function applyFacts(q){
+  if(!q) return;
+  S.q=q;
+  if(q.top){ S.cloth=String(q.top).toLowerCase(); S.clothColour=null; }
+  if(q.hair) S.hairText=String(q.hair).toLowerCase();
+  S.glasses=q.glasses===true; S.headphones=q.headphones===true;
+  if(q.hood_up===true) S.hat='hood';
+  const pn=cleanItem(q.place); if(PLACE_LINE[pn]) S.place={name:pn,score:1};
+  if(q.walls && String(q.walls).length<20) S.wall=String(q.walls).toLowerCase();
+  const behind=cleanList(q.behind);
+  if(behind.length){ S.behindList=behind; S.behind={np:'the '+behind[0], pl:/[^s]s$/.test(behind[0]), score:1}; }
+}
+function applyRear(pj){
+  if(!pj) return;
+  const pn=cleanItem(pj.place); if(PLACE_LINE[pn]) S.place={name:pn,score:1};
+  const near=cleanItem(pj.closest);
+  S.frontList=cleanList([near,...(Array.isArray(pj.objects)?pj.objects:[])]).slice(0,5);
+  const d=String(pj.detail||'').toLowerCase().trim();
+  const words=S.frontList.flatMap(x=>x.split(/\s+/)).filter(w=>w.length>3);
+  if(d.length>10 && d.length<100 && words.some(w=>d.includes(w))) S.frontDetail=d.replace(/[.\s]+$/,'');
+}
+// the entity's lines, grounded in what the models confirmed. grouped so the story can place each one
+async function writeLines(img){
+  const you=[clothText(),S.hairText].filter(Boolean), behind=(S.behindList||[]).slice(0,4), front=(S.frontList||[]).slice(0,4);
+  if(you.length+behind.length+front.length<2) return;
+  const sec=[];
+  if(front.length) sec.push(`FRONT (in the room, facing them, past their screen): ${front.join('; ')}`);
+  if(behind.length) sec.push(`BEHIND (over their shoulder): ${behind.join('; ')}`);
+  if(you.length) sec.push(`YOU (on them): ${you.join('; ')}`);
+  const raw=await qwen(img,`You write lines for a horror game. Something is in the room with the player, watching them through their webcam. This is what is really there:\n${sec.join('\n')}\nWrite one line for each item listed, at most 8 lines. Start each line with its group in capitals and a colon, e.g. "FRONT: ...". Each line must name its item using the same words, and must not mention anything that isn't listed. Lowercase after the colon, under 14 words, calm, specific and creepy, spoken to "you", about what it is doing near that thing.\nStyle examples (different items):\nFRONT: i'm standing beside the bookshelf. look up. no, don't.\nBEHIND: the lamp behind you flickers when i lean on it.\nYOU: i like the blue jumper. i'll keep it when you're gone.\nWrite nothing else.`,{max:220,sample:true,temp:.6});
+  const groups={FRONT:front,BEHIND:behind,YOU:you};
+  S.lineSets={FRONT:[],BEHIND:[],YOU:[]};
+  for(const ln of raw.split(/\n+/)){
+    const m=ln.match(/^\W*(FRONT|BEHIND|YOU)\W*:\s*(.+)$/i); if(!m) continue;
+    const g=m[1].toUpperCase(); const l=m[2].replace(/^["'“”\s]+|["'“”\s]+$/g,'').toLowerCase();
+    if(l.length<8 || l.split(' ').length>18 || /lamp behind you flickers|blue jumper|beside the bookshelf. look up/.test(l)) continue;
+    const keys=groups[g].flatMap(f=>f.split(/\s+/)).filter(w=>w.length>3);
+    if(!keys.some(k=>l.includes(k))) continue;
+    if(!S.lineSets[g].includes(l)) S.lineSets[g].push(l);
+  }
+  S.lines=[...S.lineSets.BEHIND,...S.lineSets.YOU];
+}
+// lines about what's in front of the player (rear camera). always returns something if the rear camera saw anything
+function frontLines(){
+  const L=[...(S.lineSets?.FRONT||[])], f=S.frontList||[];
+  if(S.frontDetail) L.push(`${S.frontDetail}. it did that.`);
+  if(L.length<2 && f[0]) L.push(`it's standing beside the ${f[0]}. just past the edge of your screen.`);
+  if(L.length<2 && f[1]) L.push(`the ${f[1]}. it's been touching it while you weren't looking.`);
+  return L.slice(0,3);
+}
 function parseJSON(t){
   const m=String(t||'').match(/\{[\s\S]*\}/); if(!m) return null;
   try{ return JSON.parse(m[0]); }catch(e){ return null; }
@@ -739,90 +872,66 @@ function trimCut(t){
 }
 async function florence(task,canvas,max){
   const img=pixels(canvas);
-  return rpc('florence',{img,task,max},[img.data]);
+  return rpcQ('florence',{img,task,max},[img.data]);
 }
 const PEOPLEWORDS=/\b(man|men|woman|women|boy|girl|person|people|guy|face|head|hair|eye|eyes|nose|mouth|ear|shirt|hand|arm|student|teen|child|kid|he|she|his|her)\b/i;
 async function analyse(snap){
   if(!await loadAI()) { S.state='failed'; return; }
   S.state='analysing'; stage('analyse');
+  FACTS_PROMPT=FACTS_PROMPT_TXT();
   try{
-    if(AI.clip){
-      aiStatus('analysing location');
-      const pl=await ask(snap.frame,PLACES,'a photo taken in {}','location'); S.place={name:pl.item[1],score:pl.score};
-      aiStatus('analysing background');
-      const bh=await ask(snap.bg,BEHIND,'a photo of {} in the background','behind'); S.behind={np:bh.item[1],pl:!!bh.item[2],score:bh.score};
-      S.wall=(await ask(snap.bg,WALLS,'a photo of a room with {} walls','walls')).item;
-      if(snap.torso){
-        aiStatus('analysing clothing');
-        S.cloth=(await ask(snap.torso,CLOTHES,'a photo of a person wearing {}','clothing')).item[1];
-        S.clothColour=(await ask(snap.torso,COLOURS,'a photo of a person wearing {} clothes','clothing col')).item;
-      }
-      if(snap.head){
-        aiStatus('analysing appearance');
-        S.glasses=await yes(snap.head,'a person wearing glasses','a person without glasses','glasses');
-        S.headphones=await yes(snap.head,'a person wearing headphones or earbuds','a person with no headphones','headphones');
-        const hood=await ask(snap.head,[['a person with their hood up','hood'],['a person wearing a cap or hat','cap'],['a person with nothing on their head','none']],'a photo of {}','headwear');
-        S.hat = hood.score>.55 && hood.item[1]!=='none' ? hood.item[1] : null;
-        S.hairLen=(await ask(snap.head,HAIRLEN,'a photo of a person with {}','hair length')).item[1];
-        S.hairColour=(await ask(snap.head,HAIRCOL,'a photo of a person with {}','hair colour')).item[1];
-      }
-      if(snap.faceC){
-        aiStatus('analysing face');
-        S.facialHair=(await ask(snap.faceC,FACIALHAIR,'a close-up photo of a face with {}','facial hair')).item[1];
-        S.eyes=(await ask(snap.faceC,EYECOL,'a close-up photo of a person with {}','eye colour')).item[1];
-        S.faceShape=(await ask(snap.faceC,FACESHAPE,'a photo of a person with {}','face shape')).item[1];
-        S.brows=(await ask(snap.faceC,BROWS,'a close-up photo of a person with {}','eyebrows')).item[1];
-        S.freckles=await yes(snap.faceC,'a face with freckles','a face without freckles','freckles');
-        S.piercing=await yes(snap.head,'a person with a visible ear or nose piercing','a person with no piercings','piercings');
-      }
-    }
     if(AI.qw){
-      try{
-        aiStatus(`describing scene (${AI.qwName})`);
-        S.caption=S.rawCaption=trimCut(await qwen(snap.frame,'Describe this image in detail in one paragraph: the room, the objects in it and what is in the background. Plain prose, no lists, no headings.',{max:150}));
+      // 1. you (front camera)
+      aiStatus(`reading you (${AI.qwName})`);
+      try{ applyFacts(parseJSON(await qwen(snap.frame,FACTS_PROMPT,{max:160}))); }catch(e){ console.warn('qwen facts',e); }
+      // 2. what you're facing (rear camera)
+      if(snap.rear){
+        aiStatus(`looking past your screen (${AI.qwName})`);
+        try{ applyRear(parseJSON(await qwen(snap.rear,REAR_PROMPT(),{max:150}))); }catch(e){ console.warn('qwen rear',e); }
+      }
+      // 3. its lines, about all of the above
+      aiStatus(`writing (${AI.qwName})`);
+      try{ await writeLines(snap.frame); }catch(e){ console.warn('qwen lines',e); }
+    } else {
+    if(AI.clip){
+        aiStatus('analysing location');
+        const pl=await ask(snap.frame,PLACES,'a photo taken in {}','location'); S.place={name:pl.item[1],score:pl.score};
+        aiStatus('analysing background');
+        const bh=await ask(snap.bg,BEHIND,'a photo of {} in the background','behind'); S.behind={np:bh.item[1],pl:!!bh.item[2],score:bh.score};
+        S.wall=(await ask(snap.bg,WALLS,'a photo of a room with {} walls','walls')).item;
+        if(snap.torso){
+          aiStatus('analysing clothing');
+          S.cloth=(await ask(snap.torso,CLOTHES,'a photo of a person wearing {}','clothing')).item[1];
+          S.clothColour=(await ask(snap.torso,COLOURS,'a photo of a person wearing {} clothes','clothing col')).item;
+        }
         if(snap.head){
-          aiStatus(`describing face (${AI.qwName})`);
-          S.faceCaption=S.rawFace=trimCut(await qwen(snap.head,'Describe this person in one paragraph: their face, expression, hair and what they are wearing. Plain prose, no lists.',{max:120}));
+          aiStatus('analysing appearance');
+          S.glasses=await yes(snap.head,'a person wearing glasses','a person without glasses','glasses');
+          S.headphones=await yes(snap.head,'a person wearing headphones or earbuds','a person with no headphones','headphones');
+          const hood=await ask(snap.head,[['a person with their hood up','hood'],['a person wearing a cap or hat','cap'],['a person with nothing on their head','none']],'a photo of {}','headwear');
+          S.hat = hood.score>.55 && hood.item[1]!=='none' ? hood.item[1] : null;
+          S.hairLen=(await ask(snap.head,HAIRLEN,'a photo of a person with {}','hair length')).item[1];
+          S.hairColour=(await ask(snap.head,HAIRCOL,'a photo of a person with {}','hair colour')).item[1];
         }
-        // 1) structured facts. these replace CLIP's guesses, which are often wrong (it has to pick from a fixed list)
-        aiStatus(`checking details (${AI.qwName})`);
-        const fj=await qwen(snap.frame,FACTS_PROMPT,{max:130});
-        const q=parseJSON(fj);
-        if(q){
-          S.q=q;
-          if(q.top){ S.cloth=String(q.top).toLowerCase(); S.clothColour=null; }
-          if(q.hair) S.hairText=String(q.hair).toLowerCase();
-          S.glasses=q.glasses===true; S.headphones=q.headphones===true;
-          const behind=cleanList(q.behind);
-          if(behind.length){ S.behindList=behind; S.behind={np:'the '+behind[0], pl:/[^s]s$/.test(behind[0]), score:1}; }
-          if(q.hood_up===true) S.hat='hood'; else if(S.hat==='hood') S.hat=null;
-          // CLIP's face guesses (eye colour, freckles etc.) are unreliable on a webcam; drop them once qwen has looked
-          S.eyes=null; S.freckles=false; S.piercing=false; S.faceShape=null; S.brows=null; S.facialHair=null;
+        if(snap.faceC){
+          aiStatus('analysing face');
+          S.facialHair=(await ask(snap.faceC,FACIALHAIR,'a close-up photo of a face with {}','facial hair')).item[1];
+          S.eyes=(await ask(snap.faceC,EYECOL,'a close-up photo of a person with {}','eye colour')).item[1];
+          S.faceShape=(await ask(snap.faceC,FACESHAPE,'a photo of a person with {}','face shape')).item[1];
+          S.brows=(await ask(snap.faceC,BROWS,'a close-up photo of a person with {}','eyebrows')).item[1];
+          S.freckles=await yes(snap.faceC,'a face with freckles','a face without freckles','freckles');
+          S.piercing=await yes(snap.head,'a person with a visible ear or nose piercing','a person with no piercings','piercings');
         }
-        // 2) lines, only about things qwen just confirmed it can see
-        const facts=[S.cloth, ...(S.behindList||[]), S.hairText].filter(Boolean);
-        if(facts.length>=2){
-          aiStatus(`writing (${AI.qwName})`);
-          const raw=await qwen(snap.frame,`You write lines for a horror game. Something is watching the person in this photo through their webcam. These things are definitely in the photo: ${facts.join('; ')}. Write 3 short sentences it says to them. Each sentence must mention exactly one item from that list, using the same words, and must not mention anything that is not on the list. Lowercase, under 14 words each, calm and creepy, spoken to "you".\nExamples of the style (different items):\nthe lamp behind you flickers when i lean on it.\ni like the blue jumper. i'll keep it when you're gone.\nOne sentence per line. Write nothing else.`,{max:90,sample:true,temp:.6});
-          const keys=facts.flatMap(f=>f.split(/\s+/)).filter(w=>w.length>3);
-          S.lines=raw.split(/\n+/)
-            .map(l=>l.replace(/^[\s\d.\-*"'“”]+|["'“”\s]+$/g,'').toLowerCase())
-            .filter(l=>l.length>8 && l.split(' ').length<=18 && !/^(sure|here|okay|i can)/.test(l) && !/lamp behind you flickers|blue jumper/.test(l))
-            .filter(l=>keys.some(k=>l.includes(k)))   // must actually mention something real
-            .slice(0,3);
-        }
-      }catch(e){ console.warn('qwen run',e); }
-    }
-    if(AI.fl && !S.caption){
-      aiStatus(`describing scene (${AI.flDevice})`);
-      let r=await florence('<MORE_DETAILED_CAPTION>',snap.frame,120);
-      S.rawCaption=r.raw; S.caption=fixArticle(String(r.out||'').trim());
-      if(snap.head){
-        aiStatus(`describing face (${AI.flDevice})`);
-        r=await florence('<MORE_DETAILED_CAPTION>',snap.head,100);
-        S.rawFace=r.raw; S.faceCaption=fixArticle(String(r.out||'').trim());
+      }
+      if(snap.rear && AI.clip){
+        const pl=await ask(snap.rear,PLACES,'a photo taken in {}','rear place');
+        if(!S.place || pl.score>S.place.score) S.place={name:pl.item[1],score:pl.score};
       }
     }
+    // the story has what it needs now
+    S.core=true;
+    if(running && watching && !S.announced){ S.announced=true; interject('scene analysis complete. it knows where you are now.'); }
+    // 4. extras: HUD boxes and the long descriptions for the end screen
     if(AI.fl){
       aiStatus(`mapping regions (${AI.flDevice})`);
       let r=await florence('<DENSE_REGION_CAPTION>',snap.frame,256);
@@ -832,28 +941,25 @@ async function analyse(snap){
       S.rawRegions=S.regions.map(o=>`${o.label}<loc_${o.box.map(Math.round).join('><loc_')}>`).join('');
       for(const o of S.regions){ const l=o.label.toLowerCase(); if(!PEOPLEWORDS.test(l) && !seen.has(l) && l.length<40){ seen.add(l); S.items.push(fixArticle(/^(a|an|the)\b/i.test(l)?l:'a '+l)); } }
     }
-    if(snap.rear){
-      if(AI.qw){
-        try{
-          aiStatus(`looking ahead (${AI.qwName})`);
-          const pj=parseJSON(await qwen(snap.rear,`Answer in JSON only, no other text. Keys: "place": where this photo was taken, exactly one of: ${Object.keys(PLACE_LINE).join(', ')}. "objects": an array of up to 5 specific objects clearly visible, 1-3 words each, no people or body parts.`,{max:100}));
-          if(pj){
-            const pn=String(pj.place||'').toLowerCase().trim();
-            if(PLACE_LINE[pn]) S.place={name:pn,score:1};
-            S.frontList=cleanList(pj.objects).slice(0,5);
-          }
-          S.frontCaption=trimCut(await qwen(snap.rear,'Describe this photo in one paragraph: what kind of room or place it is and what is in it. Plain prose, no lists.',{max:110}));
-        }catch(e){ console.warn('qwen rear',e); }
-      } else if(AI.clip){
-        const pl=await ask(snap.rear,PLACES,'a photo taken in {}','rear place');
-        if(!S.place || pl.score>S.place.score) S.place={name:pl.item[1],score:pl.score};
-      }
-      if(AI.fl && !S.frontCaption){ try{ const r=await florence('<MORE_DETAILED_CAPTION>',snap.rear,100); S.frontCaption=fixArticle(String(r.out||'').trim()); }catch(e){} }
+    if(AI.qw){
+      try{
+        aiStatus(`writing you down (${AI.qwName})`);
+        if(snap.head) S.faceCaption=S.rawFace=trimCut(await qwen(snap.head,'Describe this person in one detailed paragraph, like a witness statement: hair colour, length and style, facial hair, expression and where they are looking, exactly what they are wearing (colours, type, any logo or text), anything on their head or ears. Be concrete. No lists.',{max:150}));
+        S.caption=S.rawCaption=trimCut(await qwen(snap.frame,'Describe everything behind and around the person in one detailed paragraph, like a detective noting evidence: name each object with its colour and where it is (left, right, behind), any visible text, the lighting, and whether it looks like day or night. Do not describe the person. No lists.',{max:170}));
+        if(snap.rear) S.frontCaption=trimCut(await qwen(snap.rear,'This photo shows what is in front of a person sitting at their device. Describe it in one detailed paragraph, like a detective noting evidence: what kind of room it is, each object with its colour and position, any doors or windows and whether they are open, any visible text, the lighting. No lists.',{max:160}));
+      }catch(e){ console.warn('qwen descriptions',e); }
+    } else if(AI.fl){
+      try{
+        aiStatus(`describing scene (${AI.flDevice})`);
+        let r=await florence('<MORE_DETAILED_CAPTION>',snap.frame,120);
+        S.rawCaption=r.raw; S.caption=fixArticle(String(r.out||'').trim());
+        if(snap.head){ r=await florence('<MORE_DETAILED_CAPTION>',snap.head,100); S.rawFace=r.raw; S.faceCaption=fixArticle(String(r.out||'').trim()); }
+        if(snap.rear){ r=await florence('<MORE_DETAILED_CAPTION>',snap.rear,100); S.frontCaption=fixArticle(String(r.out||'').trim()); }
+      }catch(e){ console.warn('florence captions',e); }
     }
     stage(null); S.state='ready'; aiStatus('analysis complete');
-    if(running && watching && !S.announced){ S.announced=true; interject(`scene analysis complete. ${S.log.length} questions answered about you. it knows where you are now.`); }
     setTimeout(()=>{ if(S.state==='ready') aiStatus(''); },6000);
-  }catch(e){ stage(null); console.warn('analyse',e); S.state=S.place?'ready':'failed'; aiStatus(S.place?'partial analysis':'analysis failed'); }
+  }catch(e){ stage(null); console.warn('analyse',e); S.core=true; S.state=S.place?'ready':'failed'; aiStatus(S.place?'partial analysis':'analysis failed'); }
 }
 // prints everything the models produced, straight into the terminal
 async function dumpModels(title){
@@ -995,7 +1101,243 @@ async function preload(){
   intro();
 }
 
-async function waitScene(ms,onTick){ const t=performance.now(); while(S.state!=='ready'&&S.state!=='failed'&&performance.now()-t<ms){ onTick&&onTick(); await sleep(250); } return S.state==='ready'; }
+const sceneReady=()=>S.core||S.state==='ready'||S.state==='failed';
+async function waitScene(ms,onTick){ const t=performance.now(); while(!sceneReady()&&performance.now()-t<ms){ onTick&&onTick(); await sleep(250); } return sceneReady(); }
+
+// ---------------------------------------------------------------- microphone
+let mic=null;
+async function initMic(){
+  if(mic) return true;
+  initAudio(); if(!A) return false;
+  try{
+    const ms=await timeout(navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:false,autoGainControl:false}}),20000,'mic');
+    const an=A.createAnalyser(); an.fftSize=1024; A.createMediaStreamSource(ms).connect(an);
+    mic={an,buf:new Float32Array(an.fftSize),stream:ms,base:0};
+    let sum=0; for(let i=0;i<15;i++){ sum+=micLevel(true); await sleep(60); } mic.base=sum/15;
+    return true;
+  }catch(e){ console.warn('mic',e); return false; }
+}
+function micLevel(raw){ if(!mic) return 0; mic.an.getFloatTimeDomainData(mic.buf); let q=0; for(const v of mic.buf) q+=v*v; const r=Math.sqrt(q/mic.buf.length); return raw?r:Math.max(0,r-mic.base*1.3); }
+const MIC_LOUD=.03;
+function killMic(){ if(mic){ mic.stream.getTracks().forEach(t=>t.stop()); mic=null; } }
+
+// ---------------------------------------------------------------- memory between runs (this browser only)
+const MEM=(()=>{ try{ return JSON.parse(store.get('nw-mem')||'null'); }catch(e){ return null; } })();
+function saveMem(ending){
+  const found=[...new Set([...(MEM?.found||[]),ending])];
+  store.set('nw-mem',JSON.stringify({runs:(MEM?.runs||0)+1, cloth:clothText()||MEM?.cloth||'', front:S.frontList?.[0]||'', ending, found}));
+  return found;
+}
+
+// ---------------------------------------------------------------- 01:30 the phone call
+async function marlowCall(vis){
+  await type('[01:30] INCOMING CALL  ·  LINE 4  ·  INTERNAL',{cls:'white'});
+  for(let i=0;i<2;i++){ tone(440,'sine',.05,.35); await sleep(420); tone(480,'sine',.05,.35); await sleep(1100); }
+  if(await choose(['Answer','Let it ring'])===1){
+    await type('it keeps ringing.'); await sleep(1400);
+    await type('it answers itself.',{cls:'red'});
+  }
+  const M=(t,o={})=>type(t,{cls:'white',...o});
+  await M('"hello? is someone on the terminal? please be someone on the terminal."');
+  const who=await choose(['"Who is this?"','Say nothing']);
+  await M(who===0?'"marlow. d. marlow. i had this shift before you."':'"...i can hear you breathing. it\'s okay. it\'s marlow. i had this shift before you."');
+  await M('"listen, because i only get to call once."',{pause:700});
+  await M('"it can\'t open doors. it needs someone to open them for it."');
+  await M('"the monitor room door seals from your console. sealing it costs power, and you don\'t have much. don\'t leave it shut."');
+  await M('"and it moves when you\'re not watching. keep your eyes on the screen."',{pause:700});
+  await M('"is your microphone on? i need to know you\'re real."');
+  let micOk=false;
+  if(await choose(['Turn the microphone on','No'])===0){
+    addLine('  (your browser will ask for the microphone. it\'s only used for volume. nothing is recorded.)','dim');
+    micOk=await initMic();
+  }
+  if(micOk){
+    await M('"say something. anything."');
+    const said=await waitFor(()=>micLevel()>MIC_LOUD,8000);
+    await M(said?'"okay. okay, you\'re real. good."':'"...hello? i can\'t hear you. maybe that\'s better."');
+    await M('"it hunts by sound too. when it\'s close, don\'t make a sound."');
+  } else await M('"fine. then you won\'t hear it coming either."');
+  await M('"where are you sitting right now?"');
+  const w=await choose(['"In the monitor room"','"At home"']);
+  await M(w===0?'"no you\'re not."':'"no. you\'re in the monitor room. you have to be. the terminal\'s on."');
+  await M('"i\'m in the monitor room. i\'ve been in here all night. the chair is empty."');
+  await M('"but the screen is on. and someone is typing on it."',{pause:900});
+  if(vis && S.core && clothText()) await type(fixArticle(`"...why is there a ${clothText()} hanging off the back of the chair?"`),{cls:'red',pause:900});
+  else await M('"...oh. it\'s standing up."',{pause:900});
+  glitch(); thump();
+  await type('the line goes dead.',{cls:'dim',pause:900});
+  return micOk;
+}
+
+// ---------------------------------------------------------------- 02:30 the hunt (realtime)
+const HUNT_PATH=['05 LOADING BAY','04 BASEMENT','03 STAIRWELL B','02 RECORDS HALL','01 LOBBY'];
+const HUNT_SEEN=['it\'s standing in the middle of the room, facing the camera.','it\'s closer to the lens than last time.','only the top of its head is in frame. it\'s right underneath the camera.','it\'s facing the corner. its shoulders are moving like it\'s laughing.','it isn\'t moving. the timestamp keeps skipping.','it\'s looking straight down the corridor toward you.'];
+async function hunt(vis){
+  const R={caught:0,doorHits:0,looked:0,heard:0};
+  const N=HUNT_PATH.length;   // pos N = outside the monitor room door
+  const panel=document.createElement('div'); panel.className='hunt'; out.appendChild(panel);
+  let pos=0, doorAt=0, power=100, sealed=false, seen=-1, seenAt=0, busy=false, done=false, noPower=false;
+  let awaySince=0, lookCool=0, micCool=0, lastKnock=0;
+  const T0=performance.now(), DUR=120000;
+  let nextMove=T0+9000;
+  const now=()=>performance.now();
+  const clockTxt=()=>`02:${pad(30+Math.min(29,Math.floor(30*(now()-T0)/DUR)))}`;
+  const say=(t,c='')=>{ out.insertBefore(Object.assign(document.createElement('div'),{className:'line '+c,textContent:t}),panel); scrollDown(); };
+  function render(){
+    const bars=Math.round(power/10);
+    const rows=[
+      [`CLOCK ${clockTxt()}   POWER [${'█'.repeat(bars)}${'·'.repeat(10-bars)}] ${Math.ceil(power)}%`, power<25?'warn':''],
+      [`DOOR  ${noPower?'NO POWER':sealed?'SEALED':'OPEN'}`, noPower?'warn':sealed?'white':''],
+      [`LAST SEEN  ${seen<0?'-':seen>=N?'OUTSIDE YOUR DOOR':'CAM '+HUNT_PATH[seen]}${seen<0?'':`  (${Math.round((now()-seenAt)/1000)}s ago)`}`, seen>=N?'warn':''],
+    ];
+    if(mic){ const n=Math.min(10,Math.round(micLevel()/.006)); rows.push([`MIC   [${'|'.repeat(n)}${'·'.repeat(10-n)}]`, n>=5?'warn':'']); }
+    panel.innerHTML=''; for(const [t,c] of rows){ const d=document.createElement('div'); d.textContent=t; if(c) d.className=c; panel.appendChild(d); }
+  }
+  const btns=[];
+  function setButtons(){
+    choicesEl.innerHTML=''; btns.length=0;
+    [['Check cameras',checkCams],[sealed?'Open the door':'Seal the door',toggleDoor],['Hallway light',hallLight]].forEach(([label,fn],i)=>{
+      const b=document.createElement('button'); b.textContent=`${i+1}. ${label}`;
+      b.disabled=busy || (i===1 && noPower) || (i===2 && power<5);
+      b.onclick=()=>{ if(busy||done||b.disabled) return; blip(); fn(); };
+      choicesEl.appendChild(b); btns.push(b);
+    });
+  }
+  window.onkeydown=e=>{ const n=parseInt(e.key); if(btns[n-1]) btns[n-1].click(); };
+  function advance(why){
+    if(pos>=N) return;
+    pos++; tone(80,'sine',.09,.25);
+    if(pos>=N){ doorAt=now(); lastKnock=0; }
+    if(why) say(why,'red');
+  }
+  let personalUsed=0;
+  async function checkCams(){
+    busy=true; setButtons();
+    say('switching feeds...','dim'); await sleep(1100);
+    if(pos>=N){ say('every camera is empty.','red'); thump(); }
+    else {
+      let line=pickOne(HUNT_SEEN);
+      if(vis && S.core && personalUsed<2 && Math.random()<.6){
+        const f=personalUsed===0?personFact('it'):null;
+        const o=f?null:takeObjects(1)[0];
+        if(f){ line=f; personalUsed++; }
+        else if(o){ line=`it's standing next to ${o}. that isn't supposed to be in the ${HUNT_PATH[pos].slice(3).toLowerCase()}.`; personalUsed++; }
+      }
+      say(`CAM ${HUNT_PATH[pos]}: ${line}`, pos>=3?'red':'');
+    }
+    seen=pos; seenAt=now(); busy=false; setButtons();
+  }
+  function toggleDoor(){
+    if(noPower) return;
+    sealed=!sealed; thump();
+    say(sealed?'door sealed. the lock hums.':'door open.','dim'); setButtons();
+  }
+  async function hallLight(){
+    busy=true; power=Math.max(0,power-5); setButtons();
+    say('the hallway light buzzes on...','dim'); await sleep(800);
+    if(pos>=N){ say('it\'s right outside the door. it\'s looking through the glass at you.','red'); thump(); glitch(); seen=N; seenAt=now(); }
+    else if(pos===N-1) say('the corridor is empty. something moves at the far end of it, just past the light.');
+    else say('the corridor is empty.');
+    busy=false; setButtons();
+  }
+  choiceOpen=true; setButtons(); render();
+  heartbeat(true,1100);
+  while(!done){
+    await sleep(100);
+    const t=now();
+    // power
+    power=Math.max(0, power - (sealed?1.15:.12)*0.1);
+    if(power<=0 && !noPower){ noPower=true; sealed=false; say('the power\'s gone. the door won\'t seal anymore.','red'); glitch(); setButtons(); }
+    // it moves when you look away
+    if(vis && camOn && has.face){
+      const away = t-V.lastFaceAt>800 || Math.abs(V.yaw)>.55;
+      if(away){ if(!awaySince) awaySince=t; } else awaySince=0;
+      if(awaySince && t-awaySince>1500 && t>lookCool && pos<N){ lookCool=t+9000; R.looked++; advance('you looked away. it moved.'); }
+    }
+    // and when it hears you
+    if(mic && pos>=2 && t>micCool && micLevel()>MIC_LOUD){ micCool=t+7000; R.heard++; advance('it heard that.'); }
+    // and on its own, faster as 03:00 gets closer
+    if(t>nextMove && pos<N){ advance(); nextMove=t+(7000+Math.random()*4000)*lerp(1,.6,(t-T0)/DUR); }
+    // at the door
+    if(pos>=N){
+      if(t-lastKnock>1300){ lastKnock=t; tone(120,'triangle',.07,.12); }
+      if(t-doorAt>6000){
+        if(sealed){
+          R.doorHits++; say('something hits the door, hard. the seal holds.','red'); thump(); glitch();
+          pos=1+(Math.random()*2|0); nextMove=t+9000;
+        } else {
+          R.caught++;
+          await flashScare('IT\'S INSIDE');
+          say(R.caught===1?'it was in the room with you. then it wasn\'t. the door is still open.':'it doesn\'t need to come in anymore. it knows the way.','red');
+          power=Math.max(0,power-15); pos=0; nextMove=t+10000;
+          if(R.caught>=2) done=true;
+        }
+      }
+    }
+    if(t-T0>DUR) done=true;
+    render();
+  }
+  heartbeat(false);
+  choicesEl.innerHTML=''; window.onkeydown=null; choiceOpen=false;
+  render();
+  return R;
+}
+
+// ---------------------------------------------------------------- the feed stops being you
+async function desync(){
+  // 1. the lag creeps in. no announcement
+  FS.mode='delay'; FS.delay=0;
+  const ramp=setInterval(()=>{ FS.delay=Math.min(3000,FS.delay+120); },500);
+  await type('the feed on CAM 07 settles. the static clears.',{cls:'dim'});
+  await type('it\'s very quiet for a while.',{pause:2500});
+  await type('turn your head to the side. watch the feed while you do it.');
+  const turned=await waitFor(()=>Math.abs(V.yaw)>.4,10000);
+  if(turned){
+    await waitFor(()=>Math.abs(V.yaw)<.2,6000);
+    await sleep(Math.max(800,FS.delay));
+    await type('it turned late, didn\'t it.',{cls:'red'});
+    await type('only a little. it\'s still learning how you move.');
+  } else await type('you didn\'t move. the feed did anyway.',{cls:'red'});
+  clearInterval(ramp); FS.delay=Math.max(FS.delay,2500);
+  // 2. it stops copying you
+  if(BUF.starer){
+    await type('now look away from the screen. just for a second.');
+    const away=await waitFor(()=>performance.now()-V.lastFaceAt>600 || Math.abs(V.yaw)>.55,10000);
+    FS.mode='stare';
+    if(away) await waitFor(()=>performance.now()-V.lastFaceAt<300 && Math.abs(V.yaw)<.3,8000);
+    await type(away?'you looked away. it didn\'t.':'you didn\'t look away. it wouldn\'t have either.',{cls:'red'});
+    await type('it\'s still looking straight down the lens. it hasn\'t blinked.',{pause:2500});
+  }
+  // 3. a replay, with company
+  FS.mode='ghost'; FS.ghostAgo=Math.min(20000,(BUF.frames.length/6|0)*1000-2000);
+  placeFigure(); fig.p=.45; fig.on=true; glitch(); thump();
+  await type(`the timestamp jumps back ${Math.round(FS.ghostAgo/1000)} seconds.`,{cls:'dim'});
+  await type('that\'s you, a little while ago. look who\'s standing behind you.',{cls:'red',pause:3500});
+  fig.on=false; FS.mode='delay'; FS.delay=1500;
+  await type('that isn\'t you on the feed.',{cls:'red',speed:40});
+  await type('that hasn\'t been you since 03:00.',{cls:'red',speed:40,pause:1200});
+}
+
+// ---------------------------------------------------------------- it hunts by sound
+async function silence(){
+  await type('it hunts by sound.');
+  await type('it\'s in the room with you now. don\'t make a sound for twelve seconds.',{cls:'red',pause:300});
+  const meter=addLine('','dim'); heartbeat(true,800);
+  let strikes=0, cool=0; const t0=performance.now();
+  while(performance.now()-t0<12000 && strikes<3){
+    const lv=micLevel(), n=Math.min(20,Math.round(lv/.003));
+    meter.textContent=`MIC  [${'|'.repeat(n)}${'·'.repeat(20-n)}]  ${Math.ceil((12000-(performance.now()-t0))/1000)}s`;
+    if(lv>MIC_LOUD && performance.now()>cool){
+      strikes++; cool=performance.now()+1500; glitch(); thump(); fig.p=Math.min(.6,fig.p+.1);
+      addLine(strikes===1?'it heard that.':strikes===2?'it turned its head toward you.':'it knows exactly where you are.','red');
+    }
+    await sleep(80);
+  }
+  heartbeat(false);
+  meter.textContent=strikes?`MIC  ${strikes} sound${strikes>1?'s':''} detected`:'MIC  silence';
+  if(!strikes) await type('not a sound. it\'s listening very hard now.');
+  return strikes;
+}
 async function waitFor(cond,ms){ const t=performance.now(); while(performance.now()-t<ms){ if(cond()) return true; await sleep(50); } return false; }
 
 // tab switching
@@ -1024,15 +1366,17 @@ const DESC={
 async function intro(){
   out.innerHTML='';
   addLine('NIGHTWATCH','big'); gap();
+  if(MEM) addLine(`welcome back, operator. this is shift ${MEM.runs+1}. endings found: ${(MEM.found||[]).length}/3.`,'red');
   if(crashedAt) addLine(`last time the page crashed while ${STAGE_NAME[crashedAt]||crashedAt}.`,'red');
   const off=[!OPT.rear&&'back camera', OPT.qwen==='small'&&'big AI model (using the small one)', OPT.qwen==='none'&&'Qwen AI'].filter(Boolean);
   if(off.length){ addLine('safe mode: switched off '+listify(off)+'.','red'); addLine('to try everything again, add ?reset to the end of the address.','dim'); gap(); }
-  addLine('a short text horror game. about eight minutes.');
+  addLine('a text horror game. about fifteen minutes.');
   addLine('headphones on. lights off if you think you\'re tough.'); gap();
   addLine('this game watches you through your webcam the whole time.','dim');
   addLine('it tracks your face, eyes and expression live, and works out where you are, what you\'re','dim');
   addLine('wearing and what\'s behind you. the story reacts to all of it.','dim');
-  addLine('on a phone it also takes one picture with the back camera, to see what\'s in front of you.','dim');
+  addLine('if your device has a back camera, it takes one picture with it, to see what\'s in front of you.','dim');
+  addLine('it may ask for your microphone too. that\'s only used for volume.','dim');
   addLine('all of it runs on this computer. nothing is recorded, saved or uploaded.','dim');
   addLine('first run downloads the AI models (about 400MB, or around 2GB with a decent GPU) and caches them. you need internet.','dim');
   addLine('works best in Chrome or Edge, face lit from the front.','dim'); gap();
@@ -1046,6 +1390,7 @@ async function intro(){
 
 async function game(wantCam){
   running=true; out.innerHTML='';
+  const SC={caught:0,move:0,blink:0,silence:0,lookedUp:false};
   const vis = wantCam ? await boot() : false;
   tension(.25,4);
 
@@ -1072,6 +1417,9 @@ async function game(wantCam){
   await type(`LOG 01:04 - unidentified person, ${r1}.`,{cls:'dim'}); gap();
   tension(.4);
 
+  // ---- 01:30 phone call
+  const micOk=await marlowCall(vis); gap();
+
   // ---- 02:00
   await type('[02:00] hourly check. select a camera.',{cls:'white'});
   let r2=ROOMS[await choose(ROOMS.slice(0,5))];
@@ -1092,6 +1440,21 @@ async function game(wantCam){
     await type('you can hear breathing. and behind it, very faint, the sound of someone typing.');
     await type('it\'s your keyboard.',{cls:'red'});
   }
+  gap(); tension(.55);
+
+  // ---- 02:30 the hunt
+  await type('[02:30] every camera cuts out at once.',{cls:'white'});
+  await type('when they come back, there\'s someone in CAM 05. LOADING BAY.');
+  await type('it isn\'t facing the wall anymore. it\'s walking.',{cls:'red'});
+  await type('it needs to get through five rooms to reach your door. keep it out until 03:00.');
+  addLine('  check cameras to see where it is. seal the door when it\'s close. the seal drains power fast.','dim');
+  addLine('  it moves faster when you look away from the screen'+(micOk?', and when it hears you.':'.'),'dim');
+  await choose(['Start the shift']);
+  tension(.65);
+  const R=await hunt(vis); SC.caught=R.caught;
+  gap();
+  if(R.caught===0) await type(R.doorHits?`03:00. it hit the door ${R.doorHits} time${R.doorHits>1?'s':''}. it never got in.`:'03:00. it never reached your door. it didn\'t need to.');
+  else await type('03:00. you don\'t remember the last few minutes. the door is open.',{cls:'red'});
   gap(); tension(.55);
 
   // ---- 03:00
@@ -1124,7 +1487,7 @@ async function game(wantCam){
 
   // ---- CAM 07
   await type('connecting...',{cls:'dim'});
-  const feed=makeFeed('CAM 07  [UNLISTED]'); await sleep(2000);
+  const feed=makeFeed('CAM 07  [UNLISTED]'); startBuffer(); await sleep(2000);
   if(camOn){
     const s=sample();
     if(s.bright>=0&&s.bright<55) await type('it\'s dark where you are. it likes that.');
@@ -1135,9 +1498,14 @@ async function game(wantCam){
     await type(hr>=6&&hr<19?'it\'s daytime where you are. you think that helps.':'it\'s late where you are. good.');
     await type('that\'s now. that\'s you.',{cls:'red',pause:1200});
     if(vis){
-      if(S.state!=='ready' && S.state!=='failed'){
-        const l=addLine('decrypting feed...','dim');
-        await waitScene(90000,()=>{ l.textContent='decrypting feed... '+(aiEl.textContent.replace('SCENE AI · ','')||''); });
+      if(!sceneReady()){
+        const fill=['the feed is buffering. it isn\'t the connection.','something on the other end is adjusting the camera.','a hand passes in front of the lens. then another. then another.','there\'s breathing on the audio channel. it\'s slightly out of time with yours.','the timestamp on the feed is a few seconds ahead of your clock.','the picture sharpens for a second. it was closer than you thought.','it\'s taking its time. it wants to get you right.'];
+        const l=addLine('decrypting feed...','dim'); let k=0, next=performance.now()+5000; const t0=performance.now();
+        while(!sceneReady() && performance.now()-t0<150000){
+          l.textContent='decrypting feed... '+(aiEl.textContent.replace('SCENE AI · ','')||'');
+          if(performance.now()>next && k<fill.length){ out.insertBefore(Object.assign(document.createElement('div'),{className:'line dim',textContent:fill[k++]}),l); scrollDown(); next=performance.now()+8000; }
+          await sleep(250);
+        }
         l.remove();
       }
       if(S.place && S.place.score>.25 && PLACE_LINE[S.place.name]) await type(PLACE_LINE[S.place.name]);
@@ -1150,6 +1518,10 @@ async function game(wantCam){
         await type(special || `${np} behind you. don't look. it's been standing right next to ${S.behind.pl?'them':'it'}.`);
       }
       for(const l of S.lines.slice(0,2)) await type(l,{cls:'red',speed:30,pause:700});
+      if(MEM && MEM.cloth && clothText()){
+        if(sameThing(MEM.cloth,clothText())) await type(`the ${clothText()} again. it remembers it from last time.`,{cls:'red'});
+        else await type(`you changed out of the ${MEM.cloth}. it liked that one.`,{cls:'red'});
+      }
       hud=true; await sleep(400);
       await type('it\'s been studying you.',{cls:'red',pause:800});
       if(V.face){
@@ -1172,9 +1544,32 @@ async function game(wantCam){
     await type('no picture. just static.');
     await type('but there\'s a rhythm in the static. it matches your breathing.',{pause:1200});
   }
+  // ---- CAM 08: the rear camera picture, with it standing in it
+  if(vis && S.rearImg){
+    gap();
+    await type('a second feed connects underneath it.',{cls:'dim'});
+    const sf=makeStillFeed('CAM 08  [REAR SENSOR]',S.rearImg); await sleep(1600);
+    await type('that isn\'t the building either.');
+    await type('that\'s the other side of your screen. that\'s what\'s in front of you.',{cls:'red',pause:900});
+    sf.F.p=.25;
+    const fl=frontLines();
+    if(fl.length){ for(const l of fl){ await type(l,{cls:'red',speed:30,pause:800}); sf.F.p=Math.min(.75,sf.F.p+.2); } }
+    else await type('something is standing in it. look closer.',{cls:'red',pause:800});
+    sf.F.p=.85;
+    await type('don\'t look up from the screen. if you look up, it knows you know.',{pause:200});
+    if(V.face){
+      const looked=await waitFor(()=>performance.now()-V.lastFaceAt>700 || Math.abs(V.yaw)>.6 || Math.abs(V.pitch)>.45,6000);
+      if(looked){ SC.lookedUp=true; glitch(); thump(); await type('you looked. it saw you look.',{cls:'red',pause:900}); }
+      else await type('good. eyes down. it\'s still there.');
+    } else await sleep(4000);
+    closeFeed(sf,'CAM 08  ·  SIGNAL LOST');
+    await type('CAM 07 is still live next to it. you should keep watching that one.',{cls:'dim'});
+  }
+  if(vis && camOn && BUF.frames.length>30) await desync();
   placeFigure(); fig.p=.05; fig.on=true; wantSeg=true; await sleep(2000);
   await type('there\'s something in the background. no, don\'t check. keep looking at the screen.',{pause:900});
   hud=false; segEvery=300;
+  if(micOk && mic){ SC.silence=await silence(); }
 
   // ---- don't move
   watching=false;
@@ -1193,10 +1588,12 @@ async function game(wantCam){
       V.moveEMA=0; sample(); }
   }
   heartbeat(false);
+  SC.move=strikes;
   if(strikes===0) await type('good. you\'re very good at staying still. so is it.');
   fig.p=Math.max(fig.p,.3);
   await type('it\'s closer now.',{pause:900});
 
+  FS.mode='live';
   // ---- don't blink
   const canSeeEyes = vis && V.openBase>0 && faceFresh(2000);
   if(canSeeEyes){
@@ -1208,7 +1605,7 @@ async function game(wantCam){
       await sleep(60);
       if(V.blinks>b0+seen){ seen=V.blinks-b0; fig.p=Math.min(.8,fig.p+.08); glitch(); thump(); addLine(seen===1?'blink.':`blink. (${seen})`,'red'); }
     }
-    heartbeat(false);
+    heartbeat(false); SC.blink=seen;
     await type(seen===0?'ten seconds without blinking. your eyes must be burning. it waited.':`you blinked ${seen} time${seen===1?'':'s'}. it took ${seen} step${seen===1?'':'s'}.`);
   } else {
     await sleep(1500);
@@ -1287,10 +1684,26 @@ async function game(wantCam){
   // ---- end
   watching=false; fig.on=false; wantSeg=false;
   feeds.forEach(f=>f.live&&closeFeed(f)); running=false;
-  visionOn=false; killCam();
+  visionOn=false; stopBuffer(); killCam(); killMic(); dock.innerHTML='';
+  const bad=SC.caught*2+SC.move+(SC.blink>2?1:0)+SC.silence+(SC.lookedUp?1:0);
+  const ending=bad<=1?'SURVIVED':SC.caught>0?'REPLACED':'TAKEN';
+  const found=saveMem(ending);
   out.innerHTML=''; await sleep(1500);
   await type('SHIFT ENDED  06:00',{cls:'hdr'});
-  await type('OPERATOR STATUS: [no record]',{cls:'red',pause:900});
+  if(ending==='SURVIVED'){
+    await type('OPERATOR STATUS: present',{cls:'white',pause:700});
+    await type('you made it to 06:00.');
+    await type('it will be there tomorrow night. it doesn\'t sleep.');
+    await type('now neither will you.',{cls:'red',pause:900});
+  } else if(ending==='REPLACED'){
+    await type('OPERATOR STATUS: replaced',{cls:'red',pause:700});
+    await type(clothText()?fixArticle(`the operator who logged in at 06:01 was wearing a ${clothText()}.`):'the operator who logged in at 06:01 was wearing your clothes.');
+    await type('they sat exactly the way you sit.');
+    await type('they haven\'t blinked once.',{cls:'red',pause:900});
+  } else {
+    await type('OPERATOR STATUS: [no record]',{cls:'red',pause:900});
+  }
+  await type(`ENDING ${['SURVIVED','REPLACED','TAKEN'].indexOf(ending)+1}/3: ${ending}   ·   endings found: ${found.length}/3`,{cls:'dim',pause:600});
   if(vis){
     gap();
     await type('OPERATOR ANALYSIS',{cls:'white',pause:200});
@@ -1305,6 +1718,7 @@ async function game(wantCam){
       r('time out of frame',`${Math.round(V.outMs/1000)}s`),
       r('other people detected',String(V.extraSeen)),
     ];
+    lines.push(r('times it reached the door',String(SC.caught)));
     if(S.place) lines.push(r('location',S.place.name));
     if(S.cloth) lines.push(r('wearing',`${S.clothColour?S.clothColour+' ':''}${S.cloth}`));
     if(S.behind) lines.push(r('behind you',S.behind.np.replace(/^the /,'').replace(/ behind you$/,'')));
@@ -1356,6 +1770,7 @@ async function boot(){
     stage(null);
     rl.textContent='  rear sensor ............. '+(snap.rear?'captured':location.protocol==='file:'?'unavailable (open the game from a web address, not a file)':'not found');
   } else addLine('  rear sensor ............. off','dim');
+  S.rearImg=snap.rear||null;
   addLine(`  scene models ............ loading in background${OPT.qwen==='small'?' (small mode)':OPT.qwen==='none'?' (safe mode, no qwen)':''}`,'dim');
   analyse(snap);
   addLine('  > frame captured. analysis runs in the background. nothing leaves this computer.','dim');
